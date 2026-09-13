@@ -1,0 +1,879 @@
+/**
+ * Feuille de style partagee (decision 36, cf. claude/cartographie-et-plan-action.md).
+ * Objectif exprime par Ben : que les ecrans (surtout "Calcul du prix" et
+ * "Offre") s'inspirent davantage de l'Excel actuel -- grille de type tableur,
+ * en-tetes de colonnes marques, alignement numerique, totaux mis en evidence
+ * -- plutot qu'un formulaire HTML brut. N'affecte que la presentation : la
+ * logique de calcul (engine/*) et l'acces aux donnees (data/catalog.ts) ne
+ * sont pas touches par ce lot.
+ *
+ * Refonte visuelle (decision 45, 12/09/2026) : retour de Ben apres usage
+ * reel ("visuellement pas agreable a utiliser"), cible sur "Calcul du prix"
+ * et "Donnees". Objectif : garder la logique en grille type tableur (colonnes
+ * numeriques alignees) mais adoucir le rendu -- rayons et ombres plus
+ * genereux, hierarchie typographique plus nette, controles de formulaire plus
+ * confortables (fleche de select personnalisee, anneau de focus, transitions
+ * courtes), lignes d'articles traitees comme des cartes plutot que des
+ * lignes de tableau brutes, prix client mis en evidence. Purement
+ * presentationnel, comme le lot de decision 36 : aucune logique de calcul ni
+ * d'acces aux donnees modifiee. Les classes .wg-input-qty / .wg-input-sm
+ * remplacent des `style={{ width }}` repetes dans App.tsx (memes valeurs,
+ * juste factorisees) ; .wg-step-badge et .wg-btn-remove habillent des
+ * elements deja existants sans toucher a leur comportement.
+ */
+
+:root {
+  --wg-green: #1f7a4d;
+  --wg-green-dark: #145c39;
+  --wg-green-light: #e8f5ee;
+  --wg-green-lighter: #f3faf6;
+  --wg-ink: #1f2933;
+  --wg-ink-soft: #52606d;
+  --wg-ink-faint: #7b8794;
+  --wg-border: #dde3e8;
+  --wg-border-strong: #b7c2cc;
+  --wg-grid-header: #eef2f0;
+  --wg-stripe: #f7f9f8;
+  --wg-warn-bg: #fffbeb;
+  --wg-warn-border: #f3c969;
+  --wg-warn-text: #92620a;
+  --wg-danger: #b91c1c;
+  --wg-danger-bg: #fef2f2;
+  --wg-danger-border: #f3caca;
+  --wg-page-bg: #eef1f0;
+  --wg-panel-bg: #ffffff;
+  --wg-radius-sm: 5px;
+  --wg-radius: 10px;
+  --wg-radius-lg: 14px;
+  --wg-shadow: 0 1px 2px rgba(15, 40, 27, 0.05), 0 1px 1px rgba(15, 40, 27, 0.04);
+  --wg-shadow-md: 0 4px 14px rgba(15, 40, 27, 0.07), 0 1px 3px rgba(15, 40, 27, 0.06);
+  --wg-focus-ring: 0 0 0 3px rgba(31, 122, 77, 0.16);
+  --wg-transition: 130ms ease;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--wg-page-bg);
+  color: var(--wg-ink);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wg-app {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 24px 20px 64px;
+}
+
+/* "Calcul du prix" a besoin de plus de largeur pour la vue horizontale type
+   Excel (decision 42, 12/09/2026, demande de Ben : "ça prend que 50% de
+   l'écran sur la largeur... on devrait mieux exploiter l'espace de
+   l'écran") -- applique uniquement a cet onglet, les autres gardent la
+   largeur de lecture confortable existante. */
+.wg-app.wg-app--wide {
+  max-width: 1600px;
+}
+
+.wg-header h1 {
+  font-size: 22px;
+  margin: 0 0 4px;
+  color: var(--wg-green-dark);
+  letter-spacing: -0.01em;
+}
+
+.wg-header p {
+  margin: 0;
+  color: var(--wg-ink-soft);
+  font-size: 13px;
+}
+
+/* ---------- Onglets, sur le modele des onglets de feuille Excel ---------- */
+
+.wg-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 20px;
+  border-bottom: 2px solid var(--wg-border-strong);
+}
+
+.wg-tab {
+  appearance: none;
+  border: 1px solid var(--wg-border-strong);
+  border-bottom: none;
+  background: var(--wg-grid-header);
+  color: var(--wg-ink-soft);
+  padding: 9px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+  position: relative;
+  top: 2px;
+  transition: background-color var(--wg-transition), color var(--wg-transition);
+}
+
+.wg-tab:hover {
+  background: #e4ebe7;
+  color: var(--wg-green-dark);
+}
+
+.wg-tab.active {
+  background: var(--wg-panel-bg);
+  color: var(--wg-green-dark);
+  border-color: var(--wg-border-strong);
+  border-bottom: 2px solid var(--wg-panel-bg);
+  top: 2px;
+  box-shadow: 0 -2px 6px rgba(15, 40, 27, 0.04);
+}
+
+.wg-tab-spacer {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--wg-ink-soft);
+  padding-bottom: 8px;
+}
+
+/* ---------- Panneaux / sections ---------- */
+
+.wg-panel {
+  background: var(--wg-panel-bg);
+  border: 1px solid var(--wg-border);
+  border-radius: var(--wg-radius);
+  box-shadow: var(--wg-shadow);
+  padding: 18px 20px 20px;
+  margin-top: 16px;
+  transition: box-shadow var(--wg-transition);
+}
+
+.wg-panel-title {
+  display: flex;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--wg-green-dark);
+  margin: 0 0 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--wg-border);
+}
+
+/* Pastille numerotee devant le titre d'un panneau "etape" de Calcul du prix
+   (decision 45) : remplace le simple "1. " en texte par un badge rond, plus
+   lisible en un coup d'oeil dans une longue page a defiler. */
+.wg-step-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  border-radius: 50%;
+  background: var(--wg-green);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  margin-right: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* Sous-titre groupant des champs a l'interieur d'un panneau, sur le modele
+   des blocs de lignes de la feuille Excel "Calcul du prix" (decision 41). */
+.wg-subsection-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--wg-ink-faint);
+  border-top: 1px solid var(--wg-border);
+  margin: 18px 0 12px;
+  padding-top: 14px;
+}
+
+.wg-subsection-title:first-of-type {
+  border-top: none;
+  margin-top: 2px;
+  padding-top: 0;
+}
+
+.wg-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px 20px;
+}
+
+@media (max-width: 640px) {
+  .wg-grid-2 {
+    grid-template-columns: 1fr;
+  }
+}
+
+.wg-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--wg-ink-soft);
+}
+
+.wg-field input,
+.wg-field select {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--wg-ink);
+}
+
+.wg-inline-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--wg-ink);
+  margin-right: 8px;
+  padding: 5px 10px 5px 8px;
+  border-radius: 999px;
+  background: var(--wg-stripe);
+  border: 1px solid var(--wg-border);
+  transition: background-color var(--wg-transition), border-color var(--wg-transition);
+}
+
+.wg-inline-field:hover {
+  border-color: var(--wg-border-strong);
+}
+
+.wg-inline-field:has(input:checked) {
+  background: var(--wg-green-light);
+  border-color: #bfe3cd;
+  color: var(--wg-green-dark);
+}
+
+/* ---------- Champs ---------- */
+
+input[type="text"],
+input[type="number"],
+input[type="email"],
+input[type="password"],
+select,
+textarea {
+  border: 1px solid var(--wg-border);
+  border-radius: var(--wg-radius-sm);
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  background: #fff;
+  color: var(--wg-ink);
+  transition: border-color var(--wg-transition), box-shadow var(--wg-transition);
+}
+
+input[type="checkbox"] {
+  accent-color: var(--wg-green);
+  width: 14px;
+  height: 14px;
+}
+
+select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%2352606d' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+}
+
+input:hover,
+select:hover,
+textarea:hover {
+  border-color: var(--wg-border-strong);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--wg-green);
+  box-shadow: var(--wg-focus-ring);
+}
+
+label {
+  font-size: 13px;
+}
+
+/* Utilitaires de largeur (decision 45) : remplacent des `style={{ width }}`
+   identiques repetes dans App.tsx pour les quantites (Calcul du prix) et les
+   petits champs numeriques (Donnees) -- aucun changement de valeur. */
+.wg-input-qty {
+  width: 72px;
+  text-align: right;
+}
+
+.wg-input-sm {
+  width: 136px;
+}
+
+/* ---------- Boutons ---------- */
+
+button {
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  border-radius: var(--wg-radius-sm);
+  border: 1px solid var(--wg-border-strong);
+  background: #fff;
+  color: var(--wg-ink);
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background-color var(--wg-transition), border-color var(--wg-transition), box-shadow var(--wg-transition), opacity var(--wg-transition);
+}
+
+button:hover:not(:disabled) {
+  background: var(--wg-grid-header);
+  border-color: var(--wg-ink-faint);
+}
+
+button:focus-visible {
+  outline: none;
+  box-shadow: var(--wg-focus-ring);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.wg-btn-primary {
+  background: var(--wg-green);
+  border-color: var(--wg-green-dark);
+  color: #fff;
+  box-shadow: 0 1px 2px rgba(20, 92, 57, 0.2);
+}
+
+button.wg-btn-primary:hover:not(:disabled) {
+  background: var(--wg-green-dark);
+}
+
+button.wg-btn-danger {
+  color: var(--wg-danger);
+  border-color: var(--wg-danger-border);
+}
+
+button.wg-btn-danger:hover:not(:disabled) {
+  background: var(--wg-danger-bg);
+}
+
+/* "+ Ajouter un modele..." (decision 45) : chip a bordure pointillee plutot
+   qu'un simple lien souligne, plus visible comme action et coherent avec le
+   style "carte" des lignes d'articles ci-dessous. Meme className qu'avant
+   (wg-btn-link), seule la definition CSS change. */
+button.wg-btn-link {
+  border: 1.5px dashed var(--wg-border-strong);
+  background: transparent;
+  color: var(--wg-green-dark);
+  padding: 6px 12px;
+  border-radius: 999px;
+  text-decoration: none;
+  font-weight: 600;
+}
+
+button.wg-btn-link:hover:not(:disabled) {
+  border-color: var(--wg-green);
+  background: var(--wg-green-lighter);
+}
+
+/* Petit bouton rond "retirer" pour les lignes multi-selection (panneaux,
+   onduleurs). Decision 45 : remplace le bouton texte "Retirer" par une
+   pastille discrete, sur le modele des chips a fermer. */
+button.wg-btn-remove {
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
+  padding: 0;
+  border-radius: 50%;
+  color: var(--wg-ink-faint);
+  font-size: 0;
+  position: relative;
+}
+
+button.wg-btn-remove::before {
+  content: "\2715";
+  font-size: 12px;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+button.wg-btn-remove:hover:not(:disabled) {
+  background: var(--wg-danger-bg);
+  border-color: var(--wg-danger-border);
+  color: var(--wg-danger);
+}
+
+button.wg-btn-sm {
+  padding: 4px 9px;
+  font-size: 11.5px;
+}
+
+/* ---------- Tableaux "feuille de calcul" ---------- */
+
+.wg-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--wg-border);
+  border-radius: var(--wg-radius);
+  margin-top: 16px;
+}
+
+table.wg-sheet {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  background: #fff;
+}
+
+table.wg-sheet th {
+  background: var(--wg-grid-header);
+  color: var(--wg-ink-soft);
+  text-transform: uppercase;
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  font-weight: 700;
+  text-align: left;
+  padding: 9px 12px;
+  border-bottom: 2px solid var(--wg-border-strong);
+  border-right: 1px solid var(--wg-border);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+}
+
+table.wg-sheet th:last-child,
+table.wg-sheet td:last-child {
+  border-right: none;
+}
+
+table.wg-sheet td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--wg-border);
+  border-right: 1px solid var(--wg-border);
+  vertical-align: middle;
+}
+
+table.wg-sheet tbody tr:nth-child(even) {
+  background: var(--wg-stripe);
+}
+
+table.wg-sheet tbody tr {
+  transition: background-color var(--wg-transition);
+}
+
+table.wg-sheet tbody tr:hover {
+  background: var(--wg-green-light);
+}
+
+table.wg-sheet tbody tr.wg-row-edited {
+  background: var(--wg-warn-bg);
+}
+
+table.wg-sheet tbody tr.wg-row-new {
+  background: var(--wg-green-light);
+}
+
+.wg-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.wg-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.wg-badge-modified {
+  background: #f59e0b;
+  color: #fff;
+}
+
+/* ---------- Totaux / KPI ---------- */
+
+.wg-totals {
+  background: var(--wg-green-light);
+  border: 1px solid #bfe3cd;
+  border-radius: var(--wg-radius-lg);
+}
+
+.wg-totals .wg-panel-title {
+  border-bottom-color: #bfe3cd;
+}
+
+.wg-totals-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 5px 0;
+  font-size: 13px;
+  border-bottom: 1px dashed #c8e6d4;
+}
+
+.wg-totals-row:last-child {
+  border-bottom: none;
+}
+
+.wg-totals-row.wg-total-main {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--wg-green-dark);
+  padding-top: 12px;
+}
+
+/* ---------- Bannieres ---------- */
+
+.wg-banner-warning {
+  background: var(--wg-warn-bg);
+  border: 1px solid var(--wg-warn-border);
+  color: var(--wg-warn-text);
+  padding: 9px 13px;
+  border-radius: var(--wg-radius);
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.wg-banner-danger {
+  background: var(--wg-danger-bg);
+  color: var(--wg-danger);
+  padding: 9px 13px;
+  border-radius: var(--wg-radius);
+  font-size: 13px;
+}
+
+.wg-banner-success {
+  color: var(--wg-green-dark);
+  font-size: 13px;
+}
+
+/* ---------- Divers ---------- */
+
+.wg-muted {
+  color: var(--wg-ink-soft);
+  font-size: 13px;
+}
+
+.wg-data-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  margin-top: 18px;
+}
+
+@media (max-width: 640px) {
+  .wg-data-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Carte "Donnees" (decision 45) : liseret de couleur a gauche pour distinguer
+   visuellement chaque bloc thematique (Client, Production, CV, Prix de
+   l'energie, Odoo, Archelios) dans une grille par ailleurs uniforme. */
+.wg-data-card {
+  border-left: 3px solid var(--wg-green);
+}
+
+.wg-data-card h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--wg-green-dark);
+  margin: 0 0 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--wg-border);
+}
+
+.wg-data-card p {
+  margin: 4px 0;
+  font-size: 13px;
+  color: var(--wg-ink);
+}
+
+/* Groupe horizontal champ + bouton (ex : reference de devis Odoo + bouton
+   "Importer"), pour eviter que le bouton se retrouve seul en dessous d'un
+   champ pleine largeur (decision 45). */
+.wg-inline-group {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.wg-inline-group .wg-field {
+  flex: 1 1 200px;
+}
+
+/* Zone de depot fichier (import Archelios/Helioscope, a venir) */
+.wg-dropzone {
+  border: 1.5px dashed var(--wg-border-strong);
+  border-radius: var(--wg-radius);
+  padding: 26px 12px;
+  text-align: center;
+  color: var(--wg-ink-soft);
+  font-size: 13px;
+  transition: border-color var(--wg-transition), background-color var(--wg-transition);
+}
+
+.wg-dropzone:hover {
+  border-color: var(--wg-green);
+  background: var(--wg-green-lighter);
+}
+
+/* ---------- "Calcul du prix" -- vue horizontale type Excel (decision 42) ----------
+   Demande de Ben (12/09/2026) : "quand on choisit une option, on doit voir a
+   droite le produit, puis les quantites et puis ensuite le prix unitaire la
+   marge et le prix client", avec la marge/config "un peu plus a droite" et
+   le resume des prix "plutot en bas". Colonne principale (choix d'articles
+   par categorie, dans l'ordre de la feuille Excel) + colonne laterale
+   (region/regime, marge/commission, marche public). */
+
+.wg-calc-layout {
+  display: grid;
+  grid-template-columns: 1fr 300px;
+  gap: 20px;
+  align-items: start;
+  margin-top: 18px;
+}
+
+.wg-calc-sidebar {
+  position: sticky;
+  top: 12px;
+  align-self: start;
+}
+
+.wg-calc-sidebar .wg-panel {
+  border-top: 3px solid var(--wg-green);
+}
+
+.wg-calc-sidebar .wg-panel:first-child {
+  margin-top: 0;
+}
+
+@media (max-width: 960px) {
+  .wg-calc-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .wg-calc-sidebar {
+    position: static;
+  }
+}
+
+/* En-tete + lignes partagent le meme grid-template-columns pour que les
+   colonnes numeriques restent alignees quel que soit le nombre de lignes de
+   la section (voir CalcLineHeader / CalcLinePreview dans App.tsx). Colonne 1
+   = article (select+quantite+bouton, ou simple description) ; colonnes 2-8 =
+   puissance, qte, prix unitaire, prix de revient, marge, multiplicateur,
+   prix client.
+
+   Decision 45 : chaque ligne est traitee comme une petite carte (fond au
+   survol, coins arrondis, marge basse) plutot qu'une ligne de tableau nue
+   separee par un simple pointille -- plus facile a distinguer visuellement
+   quand une section contient plusieurs lignes (ex : plusieurs modeles de
+   panneaux). L'en-tete devient une barre grise pleine plutot qu'un simple
+   soulignement, pour marquer clairement le debut de la liste. */
+.wg-calc-line-header,
+.wg-calc-line-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.6fr) 90px 46px 100px 110px 90px 70px 110px;
+  gap: 6px 10px;
+  align-items: center;
+  padding: 9px 12px;
+}
+
+.wg-calc-line-header {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: var(--wg-ink-soft);
+  background: var(--wg-grid-header);
+  border-radius: var(--wg-radius-sm) var(--wg-radius-sm) 0 0;
+  margin-bottom: 2px;
+}
+
+.wg-calc-line-header > span:not(:first-child) {
+  text-align: right;
+}
+
+.wg-calc-line-row {
+  border: 1px solid transparent;
+  border-radius: var(--wg-radius-sm);
+  font-size: 13px;
+  margin-bottom: 3px;
+  transition: background-color var(--wg-transition), border-color var(--wg-transition);
+}
+
+.wg-calc-line-row:hover {
+  background: var(--wg-stripe);
+  border-color: var(--wg-border);
+}
+
+.wg-calc-line-row:last-child {
+  margin-bottom: 0;
+}
+
+.wg-calc-line-row > span:not(:first-child) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.wg-calc-line-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.wg-calc-line-controls select {
+  flex: 1 1 200px;
+}
+
+/* Prix client mis en evidence (decision 45) : seule cellule numerique
+   traitee comme un "resultat" plutot qu'une simple valeur, pour guider
+   l'oeil vers ce qui compte le plus dans une ligne d'article. */
+.wg-calc-line-price {
+  font-weight: 700;
+  color: var(--wg-green-dark);
+  background: var(--wg-green-light);
+  padding: 3px 8px;
+  border-radius: 5px;
+  display: inline-block;
+}
+
+@media (max-width: 720px) {
+  .wg-calc-line-header {
+    display: none;
+  }
+
+  .wg-calc-line-header,
+  .wg-calc-line-row {
+    grid-template-columns: 1fr 1fr 1fr;
+  }
+}
+
+/* ---------- Page de garde / onglet Offre (decision 41) ---------- */
+
+.wg-offer-cover {
+  background: var(--wg-green-light);
+  border: 1px solid #bfe3cd;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
+}
+
+.wg-offer-cover-client p {
+  margin: 3px 0;
+  font-size: 13px;
+}
+
+.wg-offer-cover-client .wg-offer-client-name {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--wg-green-dark);
+  margin-bottom: 4px;
+}
+
+.wg-offer-cover-price {
+  text-align: right;
+}
+
+.wg-offer-cover-price .wg-offer-price-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--wg-green-dark);
+  line-height: 1.1;
+}
+
+.wg-offer-cover-price .wg-offer-price-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--wg-ink-soft);
+}
+
+.wg-offer-bullets {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+
+.wg-offer-bullets li {
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+/* ---------- Offre -- refonte "type PDF reel" (decision 42, 12/09/2026) ---------- */
+
+.wg-offer-logo {
+  height: 48px;
+  width: auto;
+  display: block;
+}
+
+.wg-offer-cover-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.wg-offer-cover-company {
+  text-align: right;
+  font-size: 12px;
+  color: var(--wg-ink-soft);
+  line-height: 1.5;
+}
+
+.wg-offer-toc {
+  margin: 4px 0 0;
+  padding-left: 22px;
+  counter-reset: toc;
+}
+
+.wg-offer-toc li {
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.wg-badge-included {
+  background: var(--wg-green-light);
+  color: var(--wg-green-dark);
+  border: 1px solid #bfe3cd;
+}
+
+.wg-badge-excluded {
+  background: var(--wg-warn-bg);
+  color: var(--wg-warn-text);
+  border: 1px solid var(--wg-warn-border);
+}
+
+.wg-offer-estimate-note {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--wg-ink-soft);
+  margin-top: 4px;
+}

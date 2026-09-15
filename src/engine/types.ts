@@ -77,6 +77,13 @@ export interface Product {
   specs?: Record<string, unknown>;
   /** Onduleurs uniquement : "Mono" / "Tri + N" / "Tri sans N". */
   phaseType?: string | null;
+  /** Fiche technique PDF (decision 50, 15/09/2026) : chemin de l'objet dans
+   * le bucket Storage `product-datasheets` (migration product_datasheets),
+   * pas une URL directe -- voir data/catalog.ts pour la resolution en URL
+   * publique. null/undefined si aucune fiche jointe. */
+  datasheetPath?: string | null;
+  /** Nom de fichier d'origine, pour l'affichage (ex : "Datasheet_Jinko.pdf"). */
+  datasheetFilename?: string | null;
 }
 
 /** Ligne du catalogue carport (table `carport_configs`), Manorga uniquement a ce jour. */

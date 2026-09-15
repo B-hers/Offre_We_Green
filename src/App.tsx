@@ -168,6 +168,40 @@ function CalcLinePreview({ line, powerLabel, marginBatteryTravel, marginPvElectr
 }
 
 /**
+ * Meme 7 cellules que CalcLinePreview, mais pour un poste optionnel pas (ou
+ * plus) actif (case decochee, select sur "Aucun"...) : garde la ligne visible
+ * dans le tableau avec des tirets plutot que de la faire disparaitre, sur le
+ * modele de l'Excel audite (ou une option desactivee reste une ligne du
+ * tableau avec des "-" plutot que d'etre retiree). Evite que la grille se
+ * desaligne selon l'etat de chaque case a cocher (decision 49, 15/09/2026:
+ * "il faudrait que tout soit sous forme de tableau").
+ */
+function CalcLineEmpty() {
+  return (
+    <>
+      <span>-</span>
+      <span>-</span>
+      <span>-</span>
+      <span>-</span>
+      <span>-</span>
+      <span>-</span>
+      <span>-</span>
+    </>
+  );
+}
+
+/** CalcLinePreview si le poste est actif (ligne presente dans `bySlot`), CalcLineEmpty sinon -- voir CalcLineEmpty. */
+function CalcLineSlot({ line, powerLabel, marginPvElectrical, marginBatteryTravel }: {
+  line: OfferLine | undefined;
+  powerLabel?: string;
+  marginPvElectrical: number;
+  marginBatteryTravel: number;
+}) {
+  if (!line) return <CalcLineEmpty />;
+  return <CalcLinePreview line={line} powerLabel={powerLabel} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />;
+}
+
+/**
  * Premier ecran reel de la Phase 2 : le meme cas de reference que le
  * prototype abandonne (decision 25 du 04/09/2026), mais cette fois branche
  * sur le vrai catalogue Supabase au lieu de donnees codees en dur.
@@ -798,12 +832,29 @@ export default function App() {
   const laborAndOptionsLines = useMemo(() => {
     const result: OfferLine[] = [];
     const errors: string[] = [];
+    // Table "type Excel" (decision 49, demande de Ben : "je ne vois pas
+    // directement le budget prevu... il faudrait que tout soit sous forme de
+    // tableau, avec ... les sous totaux comme dans un tableur excel") --
+    // chaque poste est marque d'une cle stable (`__slot`, propriete hors du
+    // type OfferLine, ignoree par le moteur de calcul) pour que la JSX du
+    // panneau 6 puisse retrouver, DANS `lines` (une fois les prix appliques
+    // par computeOfferTotals, cf. `laborOptionsBySlot` plus bas), la ligne
+    // exacte a afficher a cote de chaque case a cocher/select -- plutot que
+    // de garder une reference vers l'objet non-encore-price construit ici
+    // (le prix/la marge ne seraient pas a jour : computeOfferTotals mute les
+    // objets de `lines`, pas ceux-ci directement avant leur fusion dans
+    // `lines`).
+    const push = (slot: string, line: OfferLine) => {
+      (line as OfferLine & { __slot?: string }).__slot = slot;
+      result.push(line);
+    };
     if (offerMode !== "complete") return { lines: result, errors };
 
     if (totalPanelQty > 0 && roofType) {
       const rate = laborRoofRates.find((r) => r.roofType === roofType);
       if (rate) {
-        result.push(
+        push(
+          "toiture",
           newOfferLine({
             category: "Main-d'oeuvre",
             description: `Main-d'oeuvre pose panneaux (${roofType}, ${totalPanelQty} panneaux)`,
@@ -818,7 +869,8 @@ export default function App() {
     if (totalInverterCount > 0 && laborElectricianRates.length > 0) {
       try {
         const tier = pickElectricianRateTier(totalInverterPowerKva, laborElectricianRates);
-        result.push(
+        push(
+          "electricien",
           newOfferLine({
             category: "Main-d'oeuvre",
             description: `Main-d'oeuvre electricien (${tier.inverterCountTier}, ${totalInverterCount} onduleur(s))`,
@@ -835,7 +887,8 @@ export default function App() {
     if (trenchLengthM > 0 && trenchSoilType && trenchSoilType !== NO_TRENCH_LABEL) {
       const rate = trenchRates.find((r) => r.soilType === trenchSoilType);
       if (rate) {
-        result.push(
+        push(
+          "tranchee",
           newOfferLine({
             category: "Terrassement",
             description: `Tranchee (${trenchSoilType}, ${trenchLengthM}m)`,
@@ -849,7 +902,8 @@ export default function App() {
 
     if (grdChargeToUs && totalInverterCount > 0 && regionId && grdSchedule.length > 0) {
       try {
-        result.push(
+        push(
+          "grd",
           newOfferLine({
             category: "GRD",
             description: "Etude GRD a notre charge",
@@ -866,7 +920,8 @@ export default function App() {
     if (totalPowerKwc > 0 && cablingForfaitTiers.length > 0) {
       try {
         const wc = totalPowerKwc * 1000;
-        result.push(
+        push(
+          "cablageProvision",
           newOfferLine({
             category: "Cablage",
             description: `Cablage (provision, ${wc.toFixed(0)}Wc${cablingComplique ? ", complique" : ""})`,
@@ -875,7 +930,8 @@ export default function App() {
             lineType: "marchandise",
           }),
         );
-        result.push(
+        push(
+          "matosAc",
           newOfferLine({
             category: "Cablage",
             description: `Matos AC (provision, ${wc.toFixed(0)}Wc${matosAcComplique ? ", complique" : ""})`,
@@ -891,7 +947,8 @@ export default function App() {
 
     if (certificationElectriqueEnabled && totalInverterCount > 0 && electricalCertificationTiers.length > 0) {
       try {
-        result.push(
+        push(
+          "certification",
           newOfferLine({
             category: "Certification",
             description: "Certification electrique",
@@ -909,7 +966,8 @@ export default function App() {
       try {
         const price = cabineDecouplagePrice(totalInverterPowerKva, cabineDecouplageCatalog);
         if (price > 0) {
-          result.push(
+          push(
+            "cabineDecouplage",
             newOfferLine({
               category: "Cabine de decouplage",
               description: `Cabine de decouplage (${totalInverterPowerKva.toFixed(1)} kVA)`,
@@ -927,7 +985,8 @@ export default function App() {
     if (transformateurId) {
       const t = transformateurCatalog.find((c) => c.id === transformateurId);
       if (t) {
-        result.push(
+        push(
+          "transformateur",
           newOfferLine({
             category: "Transformateur",
             description: `Transformateur ${t.modelName}`,
@@ -942,7 +1001,8 @@ export default function App() {
     if (energyMeterEnabled) {
       const c = compteurCatalog.find((x) => x.modelName === "Energy Meter" && x.specs?.phase_type === energyMeterPhase);
       if (c) {
-        result.push(
+        push(
+          "energyMeter",
           newOfferLine({
             category: "Compteur",
             description: `Energy Meter (${energyMeterPhase})`,
@@ -957,7 +1017,8 @@ export default function App() {
     if (compteurVertEnabled) {
       const c = compteurCatalog.find((x) => x.modelName === "Compteur vert" && x.specs?.phase_type === compteurVertPhase);
       if (c) {
-        result.push(
+        push(
+          "compteurVert",
           newOfferLine({
             category: "Compteur",
             description: `Compteur vert (${compteurVertPhase})`,
@@ -972,7 +1033,8 @@ export default function App() {
     if (emsId) {
       const ems = emsCatalog.find((x) => x.id === emsId);
       if (ems && ems.modelName !== "Non") {
-        result.push(
+        push(
+          "ems",
           newOfferLine({
             category: "EMS",
             description: `EMS ${ems.modelName}`,
@@ -984,7 +1046,8 @@ export default function App() {
         if (emsLicenseBillingEnabled && totalInverterCount > 0) {
           const fee = emsLicenseFee(totalInverterPowerKva, ems);
           if (fee > 0) {
-            result.push(
+            push(
+              "emsLicense",
               newOfferLine({
                 category: "EMS",
                 description: `Licence EMS ${ems.modelName} (optionnel -- formule Excel jamais reliee a une ligne, voir engine/laborEngine.ts)`,
@@ -1001,12 +1064,13 @@ export default function App() {
     const handlingByKey = (key: string) => handlingRates.find((h) => h.handlingKey === key);
     if (liftEnabled) {
       const h = handlingByKey("lift");
-      if (h) result.push(newOfferLine({ category: "Manutention", description: h.label, quantity: 1, unitCost: h.price, lineType: "service" }));
+      if (h) push("lift", newOfferLine({ category: "Manutention", description: h.label, quantity: 1, unitCost: h.price, lineType: "service" }));
     }
     if (nacelleDays > 0) {
       const h = handlingByKey("nacelle");
       if (h) {
-        result.push(
+        push(
+          "nacelle",
           newOfferLine({
             category: "Manutention",
             description: `${h.label} (${nacelleDays} jour(s))`,
@@ -1019,17 +1083,18 @@ export default function App() {
     }
     if (enlevementEnabled) {
       const h = handlingByKey("enlevement_existant");
-      if (h) result.push(newOfferLine({ category: "Manutention", description: h.label, quantity: 1, unitCost: h.price, lineType: "service" }));
+      if (h) push("enlevement", newOfferLine({ category: "Manutention", description: h.label, quantity: 1, unitCost: h.price, lineType: "service" }));
     }
     if (grueChoice) {
       const h = handlingByKey(grueChoice);
-      if (h) result.push(newOfferLine({ category: "Manutention", description: h.label, quantity: 1, unitCost: h.price, lineType: "service" }));
+      if (h) push("grue", newOfferLine({ category: "Manutention", description: h.label, quantity: 1, unitCost: h.price, lineType: "service" }));
     }
     if (totalPanelQty > 0 && transportPanelsPerTrip > 0) {
       const trips = transportTripsForPanels(totalPanelQty, transportPanelsPerTrip);
       const h = handlingByKey("transport");
       if (h && trips > 0) {
-        result.push(
+        push(
+          "transport",
           newOfferLine({
             category: "Manutention",
             description: `${h.label} (${trips} voyage(s), ${totalPanelQty} panneaux)`,
@@ -1044,17 +1109,17 @@ export default function App() {
     const flatFeeByKey = (key: string) => flatFeeOptions.find((f) => f.feeKey === key);
     if (greenBoxEnabled) {
       const f = flatFeeByKey("green_box");
-      if (f) result.push(newOfferLine({ category: "Divers", description: f.label, quantity: 1, unitCost: f.price, lineType: f.category }));
+      if (f) push("greenBox", newOfferLine({ category: "Divers", description: f.label, quantity: 1, unitCost: f.price, lineType: f.category }));
     }
     if (brugelEnabled) {
       const f = flatFeeByKey("certification_brugel");
       if (f && (!f.regionRestriction || f.regionRestriction === region)) {
-        result.push(newOfferLine({ category: "Divers", description: f.label, quantity: 1, unitCost: f.price, lineType: f.category }));
+        push("brugel", newOfferLine({ category: "Divers", description: f.label, quantity: 1, unitCost: f.price, lineType: f.category }));
       }
     }
     if (stabilityStudyEnabled) {
       const f = flatFeeByKey("stability_study");
-      if (f) result.push(newOfferLine({ category: "Divers", description: f.label, quantity: 1, unitCost: f.price, lineType: f.category }));
+      if (f) push("stabilityStudy", newOfferLine({ category: "Divers", description: f.label, quantity: 1, unitCost: f.price, lineType: f.category }));
     }
 
     return { lines: result, errors };
@@ -1434,20 +1499,23 @@ export default function App() {
   const optimizerLines = lines.filter((l) => l.category === "Optimiseur");
   const batteryLines = lines.filter((l) => l.category === "Batterie");
   const structureLines = lines.filter((l) => l.category === "Structure");
-  const cablingLines = lines.filter((l) => l.category === "Elec" || l.category === "Cablage");
-  const laborAdminCategories = [
-    "Main-d'oeuvre",
-    "Terrassement",
-    "GRD",
-    "Certification",
-    "Cabine de decouplage",
-    "Transformateur",
-    "Compteur",
-    "EMS",
-    "Manutention",
-    "Divers",
-  ];
-  const laborAdminLines = lines.filter((l) => laborAdminCategories.includes(l.category));
+  // Postes "Cablage (provision)" / "Matos AC (provision)" desormais affiches
+  // en ligne dans le panneau 5, via laborOptionsBySlot -- seul le cablage
+  // AC/DC calcule automatiquement (categorie "Elec", pas de case a cocher
+  // associee) reste liste ici (decision 49, 15/09/2026).
+  const cableAutoLines = lines.filter((l) => l.category === "Elec");
+  // Retrouve, pour chaque poste optionnel du panneau 6 (et les 2 postes
+  // cablage du panneau 5), sa ligne CORRECTEMENT PRICEE (`unitPrice`/
+  // `marginAppliedAmount` a jour) dans `lines` -- c'est `lines` (pas
+  // `laborAndOptionsLines.lines`) que `totals`/`nonBatteryTotals` mutent via
+  // computeOfferTotals ci-dessus ; lire directement `laborAndOptionsLines`
+  // exposerait les objets tels que construits AVANT ce calcul (prix/marge a
+  // 0). Marquage par `__slot`, pose par `push()` dans laborAndOptionsLines.
+  const laborOptionsBySlot: Record<string, OfferLine> = {};
+  for (const l of lines) {
+    const slot = (l as OfferLine & { __slot?: string }).__slot;
+    if (slot) laborOptionsBySlot[slot] = l;
+  }
   const travelLines = lines.filter((l) => l.category === "Deplacement");
 
   // ---- Derives pour l'onglet "Offre" (decision 42, 12/09/2026) : rebatie sur
@@ -1792,15 +1860,21 @@ export default function App() {
                     <input type="number" min={1} value={dcCircuitCount} onChange={(e) => setDcCircuitCount(Number(e.target.value))} />
                   </label>
                 </div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 20px", marginTop: 10 }}>
-                  <label className="wg-inline-field">
+                <p className="wg-subsection-title">Cablage et matos AC (provision forfaitaire par tranche de puissance)</p>
+                <CalcLineHeader articleLabel="Poste" />
+                <div className="wg-calc-line-row">
+                  <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={cablingComplique} onChange={(e) => setCablingComplique(e.target.checked)} />
                     Cablage complique
                   </label>
-                  <label className="wg-inline-field">
+                  <CalcLineSlot line={laborOptionsBySlot.cablageProvision} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
+                <div className="wg-calc-line-row">
+                  <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={matosAcComplique} onChange={(e) => setMatosAcComplique(e.target.checked)} />
                     Matos AC complique
                   </label>
+                  <CalcLineSlot line={laborOptionsBySlot.matosAc} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
                 </div>
 
                 {cableAc.errors.map((err, idx) => (
@@ -1810,11 +1884,11 @@ export default function App() {
                 ))}
                 {cableDc.error && <p className="wg-banner-warning">Cablage DC : {cableDc.error}</p>}
 
-                {cablingLines.length > 0 && (
+                {cableAutoLines.length > 0 && (
                   <>
-                    <p className="wg-subsection-title">Detail des prix de cette section</p>
+                    <p className="wg-subsection-title">Cablage AC/DC (calcule automatiquement selon les onduleurs et panneaux ci-dessus)</p>
                     <CalcLineHeader articleLabel="Poste cablage" />
-                    {cablingLines.map((line, idx) => (
+                    {cableAutoLines.map((line, idx) => (
                       <div key={`cabling-${idx}`} className="wg-calc-line-row">
                         <span>{line.description}</span>
                         <CalcLinePreview line={line} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
@@ -1839,10 +1913,25 @@ export default function App() {
                   cabine de decouplage, transformateur, compteurs, EMS, manutention et forfaits divers.
                 </p>
 
+                {laborAndOptionsLines.errors.map((err, idx) => (
+                  <p key={idx} className="wg-banner-warning">
+                    {err}
+                  </p>
+                ))}
+
+                {/* Chaque poste ci-dessous est une ligne de tableau (comme dans
+                    l'Excel) : le controle (select/case a cocher) et le prix/la
+                    marge resultants sont dans la MEME ligne, plus besoin de
+                    descendre jusqu'au recapitulatif du bas pour voir le budget
+                    d'un poste qu'on vient de cocher (decision 49, 15/09/2026,
+                    demande de Ben). Un poste desactive reste visible avec des
+                    "-" (CalcLineSlot / CalcLineEmpty) plutot que de disparaitre. */}
+
                 <p className="wg-subsection-title">Toiture et tranchee</p>
-                <div className="wg-grid-2">
-                  <label className="wg-field">
-                    Type de toiture (main-d'oeuvre pose)
+                <CalcLineHeader articleLabel="Poste" />
+                <div className="wg-calc-line-row">
+                  <div className="wg-calc-line-controls">
+                    <span className="wg-muted">Toiture :</span>
                     <select value={roofType} onChange={(e) => setRoofType(e.target.value)}>
                       {laborRoofRates.map((r) => (
                         <option key={r.roofType} value={r.roofType}>
@@ -1850,9 +1939,12 @@ export default function App() {
                         </option>
                       ))}
                     </select>
-                  </label>
-                  <label className="wg-field">
-                    Tranchee -- type de sol
+                  </div>
+                  <CalcLineSlot line={laborOptionsBySlot.toiture} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
+                <div className="wg-calc-line-row">
+                  <div className="wg-calc-line-controls">
+                    <span className="wg-muted">Tranchee :</span>
                     <select value={trenchSoilType} onChange={(e) => setTrenchSoilType(e.target.value)}>
                       {trenchRates.map((r) => (
                         <option key={r.soilType} value={r.soilType}>
@@ -1860,22 +1952,32 @@ export default function App() {
                         </option>
                       ))}
                     </select>
-                  </label>
-                  {trenchSoilType !== NO_TRENCH_LABEL && (
-                    <label className="wg-field">
-                      Longueur de tranchee (m)
-                      <input type="number" min={0} value={trenchLengthM} onChange={(e) => setTrenchLengthM(Number(e.target.value))} />
-                    </label>
-                  )}
+                    {trenchSoilType !== NO_TRENCH_LABEL && (
+                      <input
+                        type="number"
+                        min={0}
+                        value={trenchLengthM}
+                        onChange={(e) => setTrenchLengthM(Number(e.target.value))}
+                        className="wg-input-qty"
+                        title="Longueur de tranchee (m)"
+                      />
+                    )}
+                  </div>
+                  <CalcLineSlot line={laborOptionsBySlot.tranchee} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
                 </div>
-                <p className="wg-muted" style={{ marginTop: 8 }}>
-                  Main-d'oeuvre electricien et cabine de decouplage (au-dela de 30 kVA) : calculees automatiquement a
-                  partir de la puissance onduleurs totale ci-dessus, aucune saisie requise.
-                </p>
+                <div className="wg-calc-line-row">
+                  <span className="wg-muted">Main-d'oeuvre electricien (auto, selon kVA total)</span>
+                  <CalcLineSlot line={laborOptionsBySlot.electricien} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
+                <div className="wg-calc-line-row">
+                  <span className="wg-muted">Cabine de decouplage (auto, au-dela de 30 kVA)</span>
+                  <CalcLineSlot line={laborOptionsBySlot.cabineDecouplage} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
 
                 <p className="wg-subsection-title">Certifications et compteurs</p>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 20px", marginBottom: 10 }}>
-                  <label className="wg-inline-field">
+                <CalcLineHeader articleLabel="Poste" />
+                <div className="wg-calc-line-row">
+                  <label className="wg-inline-field wg-calc-line-controls">
                     <input
                       type="checkbox"
                       checked={certificationElectriqueEnabled}
@@ -1883,47 +1985,54 @@ export default function App() {
                     />
                     Certification electrique
                   </label>
-                  <label className="wg-inline-field">
+                  <CalcLineSlot line={laborOptionsBySlot.certification} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
+                <div className="wg-calc-line-row">
+                  <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={greenBoxEnabled} onChange={(e) => setGreenBoxEnabled(e.target.checked)} />
                     Green Box
                   </label>
-                  {region === Region.BRUXELLES && (
-                    <label className="wg-inline-field">
+                  <CalcLineSlot line={laborOptionsBySlot.greenBox} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
+                {region === Region.BRUXELLES && (
+                  <div className="wg-calc-line-row">
+                    <label className="wg-inline-field wg-calc-line-controls">
                       <input type="checkbox" checked={brugelEnabled} onChange={(e) => setBrugelEnabled(e.target.checked)} />
                       Certification Brugel
                     </label>
-                  )}
-                  <label className="wg-inline-field">
-                    <input type="checkbox" checked={compteurVertEnabled} onChange={(e) => setCompteurVertEnabled(e.target.checked)} />
-                    Compteur vert
-                  </label>
-                </div>
-                {compteurVertEnabled && (
-                  <label className="wg-field" style={{ maxWidth: 280 }}>
-                    Compteur vert -- phase
-                    <select value={compteurVertPhase} onChange={(e) => setCompteurVertPhase(e.target.value)}>
-                      {compteurCatalog
-                        .filter((c) => c.modelName === "Compteur vert")
-                        .map((c) => (
-                          <option key={c.id} value={String(c.specs?.phase_type ?? "")}>
-                            {String(c.specs?.phase_type ?? "")} - {c.unitPrice.toFixed(2)} EUR
-                          </option>
-                        ))}
-                    </select>
-                  </label>
+                    <CalcLineSlot line={laborOptionsBySlot.brugel} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  </div>
                 )}
+                <div className="wg-calc-line-row">
+                  <div className="wg-calc-line-controls">
+                    <label className="wg-inline-field">
+                      <input type="checkbox" checked={compteurVertEnabled} onChange={(e) => setCompteurVertEnabled(e.target.checked)} />
+                      Compteur vert
+                    </label>
+                    {compteurVertEnabled && (
+                      <select value={compteurVertPhase} onChange={(e) => setCompteurVertPhase(e.target.value)}>
+                        {compteurCatalog
+                          .filter((c) => c.modelName === "Compteur vert")
+                          .map((c) => (
+                            <option key={c.id} value={String(c.specs?.phase_type ?? "")}>
+                              {String(c.specs?.phase_type ?? "")} - {c.unitPrice.toFixed(2)} EUR
+                            </option>
+                          ))}
+                      </select>
+                    )}
+                  </div>
+                  <CalcLineSlot line={laborOptionsBySlot.compteurVert} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
 
                 <p className="wg-subsection-title">Energy Meter, EMS, transformateur</p>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 20px", marginBottom: 10 }}>
-                  <label className="wg-inline-field">
-                    <input type="checkbox" checked={energyMeterEnabled} onChange={(e) => setEnergyMeterEnabled(e.target.checked)} />
-                    Energy Meter
-                  </label>
-                </div>
-                <div className="wg-grid-2">
-                  {energyMeterEnabled && (
-                    <label className="wg-field">
-                      Energy Meter -- phase
+                <CalcLineHeader articleLabel="Poste" />
+                <div className="wg-calc-line-row">
+                  <div className="wg-calc-line-controls">
+                    <label className="wg-inline-field">
+                      <input type="checkbox" checked={energyMeterEnabled} onChange={(e) => setEnergyMeterEnabled(e.target.checked)} />
+                      Energy Meter
+                    </label>
+                    {energyMeterEnabled && (
                       <select value={energyMeterPhase} onChange={(e) => setEnergyMeterPhase(e.target.value)}>
                         {compteurCatalog
                           .filter((c) => c.modelName === "Energy Meter")
@@ -1933,10 +2042,13 @@ export default function App() {
                             </option>
                           ))}
                       </select>
-                    </label>
-                  )}
-                  <label className="wg-field">
-                    EMS (optionnel)
+                    )}
+                  </div>
+                  <CalcLineSlot line={laborOptionsBySlot.energyMeter} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
+                <div className="wg-calc-line-row">
+                  <div className="wg-calc-line-controls">
+                    <span className="wg-muted">EMS :</span>
                     <select value={emsId} onChange={(e) => setEmsId(e.target.value)}>
                       <option value="">Aucun</option>
                       {emsCatalog.map((e) => (
@@ -1945,9 +2057,25 @@ export default function App() {
                         </option>
                       ))}
                     </select>
-                  </label>
-                  <label className="wg-field">
-                    Transformateur (optionnel)
+                  </div>
+                  <CalcLineSlot line={laborOptionsBySlot.ems} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
+                {emsId && emsCatalog.find((e) => e.id === emsId)?.specs?.requires_license === true && (
+                  <div className="wg-calc-line-row">
+                    <label className="wg-inline-field wg-calc-line-controls">
+                      <input
+                        type="checkbox"
+                        checked={emsLicenseBillingEnabled}
+                        onChange={(e) => setEmsLicenseBillingEnabled(e.target.checked)}
+                      />
+                      Licence EMS (hors Excel actif, voir note)
+                    </label>
+                    <CalcLineSlot line={laborOptionsBySlot.emsLicense} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  </div>
+                )}
+                <div className="wg-calc-line-row">
+                  <div className="wg-calc-line-controls">
+                    <span className="wg-muted">Transformateur :</span>
                     <select value={transformateurId} onChange={(e) => setTransformateurId(e.target.value)}>
                       <option value="">Aucun</option>
                       {transformateurCatalog.map((t) => (
@@ -1956,43 +2084,48 @@ export default function App() {
                         </option>
                       ))}
                     </select>
-                  </label>
+                  </div>
+                  <CalcLineSlot line={laborOptionsBySlot.transformateur} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
                 </div>
-                {emsId && emsCatalog.find((e) => e.id === emsId)?.specs?.requires_license === true && (
-                  <label className="wg-inline-field" style={{ marginTop: 8 }}>
-                    <input
-                      type="checkbox"
-                      checked={emsLicenseBillingEnabled}
-                      onChange={(e) => setEmsLicenseBillingEnabled(e.target.checked)}
-                    />
-                    Facturer la licence EMS (hors Excel actif, voir note)
-                  </label>
-                )}
 
                 <p className="wg-subsection-title">Manutention</p>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 20px", marginBottom: 10 }}>
-                  <label className="wg-inline-field">
+                <CalcLineHeader articleLabel="Poste" />
+                <div className="wg-calc-line-row">
+                  <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={liftEnabled} onChange={(e) => setLiftEnabled(e.target.checked)} />
                     Lift
                   </label>
-                  <label className="wg-inline-field">
-                    <input type="checkbox" checked={nacelleDays > 0} onChange={(e) => setNacelleDays(e.target.checked ? 1 : 0)} />
-                    Nacelle
-                  </label>
-                  <label className="wg-inline-field">
+                  <CalcLineSlot line={laborOptionsBySlot.lift} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
+                <div className="wg-calc-line-row">
+                  <div className="wg-calc-line-controls">
+                    <label className="wg-inline-field">
+                      <input type="checkbox" checked={nacelleDays > 0} onChange={(e) => setNacelleDays(e.target.checked ? 1 : 0)} />
+                      Nacelle
+                    </label>
+                    {nacelleDays > 0 && (
+                      <input
+                        type="number"
+                        min={0}
+                        value={nacelleDays}
+                        onChange={(e) => setNacelleDays(Number(e.target.value))}
+                        className="wg-input-qty"
+                        title="Nombre de jours"
+                      />
+                    )}
+                  </div>
+                  <CalcLineSlot line={laborOptionsBySlot.nacelle} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
+                <div className="wg-calc-line-row">
+                  <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={enlevementEnabled} onChange={(e) => setEnlevementEnabled(e.target.checked)} />
                     Enlevement installation existante
                   </label>
+                  <CalcLineSlot line={laborOptionsBySlot.enlevement} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
                 </div>
-                <div className="wg-grid-2">
-                  {nacelleDays > 0 && (
-                    <label className="wg-field">
-                      Nombre de jours de nacelle
-                      <input type="number" min={0} value={nacelleDays} onChange={(e) => setNacelleDays(Number(e.target.value))} />
-                    </label>
-                  )}
-                  <label className="wg-field">
-                    Grue (optionnelle)
+                <div className="wg-calc-line-row">
+                  <div className="wg-calc-line-controls">
+                    <span className="wg-muted">Grue :</span>
                     <select value={grueChoice} onChange={(e) => setGrueChoice(e.target.value)}>
                       <option value="">Aucune</option>
                       {handlingRates
@@ -2003,42 +2136,30 @@ export default function App() {
                           </option>
                         ))}
                     </select>
-                  </label>
+                  </div>
+                  <CalcLineSlot line={laborOptionsBySlot.grue} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
                 </div>
-                <p className="wg-muted" style={{ marginTop: 8 }}>
-                  Transport : deduit automatiquement du nombre de panneaux, aucune saisie requise.
-                </p>
+                <div className="wg-calc-line-row">
+                  <span className="wg-muted">Transport (auto, deduit du nombre de panneaux)</span>
+                  <CalcLineSlot line={laborOptionsBySlot.transport} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
 
                 <p className="wg-subsection-title">Etudes complementaires</p>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 20px" }}>
-                  <label className="wg-inline-field">
+                <CalcLineHeader articleLabel="Poste" />
+                <div className="wg-calc-line-row">
+                  <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={stabilityStudyEnabled} onChange={(e) => setStabilityStudyEnabled(e.target.checked)} />
                     Etude de stabilite
                   </label>
-                  <label className="wg-inline-field">
+                  <CalcLineSlot line={laborOptionsBySlot.stabilityStudy} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                </div>
+                <div className="wg-calc-line-row">
+                  <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={grdChargeToUs} onChange={(e) => setGrdChargeToUs(e.target.checked)} />
                     Etude GRD a notre charge
                   </label>
+                  <CalcLineSlot line={laborOptionsBySlot.grd} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
                 </div>
-
-                {laborAndOptionsLines.errors.map((err, idx) => (
-                  <p key={idx} className="wg-banner-warning">
-                    {err}
-                  </p>
-                ))}
-
-                {laborAdminLines.length > 0 && (
-                  <>
-                    <p className="wg-subsection-title">Detail des prix de cette section</p>
-                    <CalcLineHeader articleLabel="Poste" />
-                    {laborAdminLines.map((line, idx) => (
-                      <div key={`labor-${idx}`} className="wg-calc-line-row">
-                        <span>{line.description}</span>
-                        <CalcLinePreview line={line} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
-                      </div>
-                    ))}
-                  </>
-                )}
               </div>
             )}
 

@@ -697,7 +697,7 @@ table.wg-sheet tbody tr.wg-row-new {
 .wg-calc-line-header,
 .wg-calc-line-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1.6fr) 90px 46px 100px 110px 90px 70px 110px;
+  grid-template-columns: minmax(220px, 1.6fr) 90px 46px 100px 110px 90px 70px 110px 170px;
   gap: 6px 10px;
   align-items: center;
   padding: 9px 12px;
@@ -716,6 +716,14 @@ table.wg-sheet tbody tr.wg-row-new {
 
 .wg-calc-line-header > span:not(:first-child) {
   text-align: right;
+}
+
+/* Derniere colonne = "Actions" (decision 55) : boutons alignes a gauche dans
+   la cellule, pas des chiffres a aligner a droite comme le reste de la
+   ligne -- voir aussi .wg-calc-line-actions plus bas pour la cellule de
+   contenu correspondante. */
+.wg-calc-line-header > span:last-child {
+  text-align: left;
 }
 
 .wg-calc-line-row {
@@ -762,6 +770,68 @@ table.wg-sheet tbody tr.wg-row-new {
   padding: 3px 8px;
   border-radius: 5px;
   display: inline-block;
+}
+
+/* Colonne "Actions" (decision 55, 15/09/2026) : bouton "Modifier le prix" /
+   "Annuler" directement dans chaque section, plus la case "Poste marche
+   public" quand ce mode est actif -- remplace l'ancien tableau separe
+   "Detail complet des lignes" en bas de page. Annule le text-align:right /
+   white-space:nowrap herites de `.wg-calc-line-row > span:not(:first-child)`
+   (ok pour des chiffres, pas pour des boutons qui doivent pouvoir
+   s'empiler/wrapper proprement). */
+.wg-calc-line-actions {
+  text-align: left !important;
+  white-space: normal !important;
+}
+
+.wg-line-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.wg-line-actions button.wg-btn-link {
+  font-size: 11px;
+  padding: 2px 0;
+}
+
+.wg-line-actions-tender {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--wg-ink-faint);
+  white-space: normal;
+}
+
+/* Sous-total d'une section (decision 55) : cout/marge/prix client cumules
+   des postes de la section, juste avant de passer a la suivante -- sur le
+   modele d'un sous-total de tableur, pas un second "Resume des prix". */
+.wg-section-subtotal {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px 18px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--wg-border);
+  font-size: 12px;
+  color: var(--wg-ink-soft);
+}
+
+.wg-section-subtotal-label {
+  margin-right: auto;
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  color: var(--wg-ink-faint);
+  align-self: center;
+}
+
+.wg-section-subtotal strong {
+  color: var(--wg-green-dark);
 }
 
 @media (max-width: 720px) {

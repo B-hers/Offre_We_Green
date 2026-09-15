@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { supabaseConfigured } from "./supabaseClient";
 import { useSupabaseAuth } from "./useAuth";
 import LoginPanel from "./components/LoginPanel";
@@ -298,6 +298,7 @@ function CalcLineHeader({ articleLabel = "Article" }: { articleLabel?: string })
       <span>Marge</span>
       <span>Multipl.</span>
       <span>Prix client</span>
+      <span>Actions</span>
     </div>
   );
 }
@@ -319,22 +320,27 @@ function CalcLineHeader({ articleLabel = "Article" }: { articleLabel?: string })
  * OfferLine ne porte pas de puissance -- volontairement, pour ne pas toucher
  * au moteur de calcul valide pour une simple info d'affichage.
  */
-function CalcLinePreview({ line, powerLabel, marginBatteryTravel, marginPvElectrical }: {
+function CalcLinePreview({ line, powerLabel, marginBatteryTravel, marginPvElectrical, actions }: {
   line: OfferLine;
   powerLabel?: string;
   marginPvElectrical: number;
   marginBatteryTravel: number;
+  actions?: ReactNode;
 }) {
   const multiplier = CATEGORIES_MARGIN_BATTERY_TRAVEL.has(line.category) ? marginBatteryTravel : marginPvElectrical;
   return (
     <>
       <span>{powerLabel ?? "-"}</span>
       <span>{line.quantity}</span>
-      <span>{line.unitCost.toFixed(2)} EUR</span>
-      <span>{lineTotalCost(line).toFixed(2)} EUR</span>
-      <span>{line.marginAppliedAmount.toFixed(2)} EUR</span>
+      <span>{formatEur(line.unitCost)}</span>
+      <span>{formatEur(lineTotalCost(line))}</span>
+      <span>{formatEur(line.marginAppliedAmount)}</span>
       <span>x{multiplier.toFixed(3)}</span>
-      <span className="wg-calc-line-price">{lineTotalPrice(line).toFixed(2)} EUR</span>
+      <span className="wg-calc-line-price">
+        {formatEur(lineTotalPrice(line))}
+        {line.manuallyOverridden && <span className="wg-badge wg-badge-modified">modifie</span>}
+      </span>
+      <span className="wg-calc-line-actions">{actions}</span>
     </>
   );
 }
@@ -358,19 +364,59 @@ function CalcLineEmpty() {
       <span>-</span>
       <span>-</span>
       <span>-</span>
+      <span></span>
     </>
   );
 }
 
 /** CalcLinePreview si le poste est actif (ligne presente dans `bySlot`), CalcLineEmpty sinon -- voir CalcLineEmpty. */
-function CalcLineSlot({ line, powerLabel, marginPvElectrical, marginBatteryTravel }: {
+function CalcLineSlot({ line, powerLabel, marginPvElectrical, marginBatteryTravel, actions }: {
   line: OfferLine | undefined;
   powerLabel?: string;
   marginPvElectrical: number;
   marginBatteryTravel: number;
+  actions?: ReactNode;
 }) {
   if (!line) return <CalcLineEmpty />;
-  return <CalcLinePreview line={line} powerLabel={powerLabel} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />;
+  return (
+    <CalcLinePreview
+      line={line}
+      powerLabel={powerLabel}
+      marginPvElectrical={marginPvElectrical}
+      marginBatteryTravel={marginBatteryTravel}
+      actions={actions}
+    />
+  );
+}
+
+/**
+ * Sous-total d'une section du panneau "Calcul du prix" (decision 55,
+ * 15/09/2026, demande de Ben : "qu'il y ait une somme de chacun des postes
+ * contenus dans chacune des sections", au moins prix de revient/marge/prix
+ * client). Pur agregat d'affichage sur les lignes deja calculees (mêmes
+ * lignes que celles rendues par les CalcLinePreview/CalcLineSlot de la
+ * section, jamais un recalcul) -- une section sans ligne active ne montre
+ * rien plutot qu'un sous-total a 0.
+ */
+function SectionSubtotal({ lines }: { lines: OfferLine[] }) {
+  if (lines.length === 0) return null;
+  const cost = lines.reduce((sum, l) => sum + lineTotalCost(l), 0);
+  const margin = lines.reduce((sum, l) => sum + l.marginAppliedAmount, 0);
+  const price = lines.reduce((sum, l) => sum + lineTotalPrice(l), 0);
+  return (
+    <div className="wg-section-subtotal">
+      <span className="wg-section-subtotal-label">Sous-total section</span>
+      <span>
+        Prix de revient <strong>{formatEur(cost)}</strong>
+      </span>
+      <span>
+        Marge <strong>{formatEur(margin)}</strong>
+      </span>
+      <span>
+        Prix client <strong>{formatEur(price)}</strong>
+      </span>
+    </div>
+  );
 }
 
 /**
@@ -1893,6 +1939,72 @@ export default function App() {
   }
   const travelLines = lines.filter((l) => l.category === "Deplacement");
 
+  // Actions par ligne (modifier le prix / marche public) directement dans
+  // chaque section 1 a 7, remplace l'ancien tableau separe "Detail complet
+  // des lignes" en bas de page (decision 55, 15/09/2026, demande de Ben :
+  // "le bouton modifier le prix se trouve directement dans les differentes
+  // sections"). La cle `${category}-${idx}` doit rester identique a celle
+  // utilisee par overriddenLines/repartitionOverrides plus haut (voir le
+  // useMemo `lines`) : idx est ici retrouve par reference dans `lines`
+  // (memes objets que ceux filtres/regroupes ci-dessus), pas recalcule.
+  const lineIndexMap = new Map<OfferLine, number>();
+  lines.forEach((l, i) => lineIndexMap.set(l, i));
+  const renderLineActions = (line: OfferLine | undefined): ReactNode => {
+    if (!line) return null;
+    const idx = lineIndexMap.get(line);
+    if (idx === undefined) return null;
+    const key = `${line.category}-${idx}`;
+    const repartitionResult = repartitionResults?.[idx];
+    return (
+      <div className="wg-line-actions">
+        <button
+          type="button"
+          className="wg-btn-link"
+          onClick={() => {
+            const value = window.prompt("Nouveau prix unitaire (EUR) :", line.unitPrice.toFixed(2));
+            if (value === null) return;
+            const parsed = Number(value);
+            if (!Number.isNaN(parsed)) {
+              setOverriddenLines((prev) => ({ ...prev, [key]: parsed }));
+            }
+          }}
+        >
+          Modifier le prix
+        </button>
+        {line.manuallyOverridden && (
+          <button
+            type="button"
+            className="wg-btn-link"
+            onClick={() =>
+              setOverriddenLines((prev) => {
+                const next = { ...prev };
+                delete next[key];
+                return next;
+              })
+            }
+          >
+            Annuler
+          </button>
+        )}
+        {isPublicTender && (
+          <label className="wg-line-actions-tender">
+            <input
+              type="checkbox"
+              checked={line.repartitionPoste}
+              onChange={(e) => setRepartitionOverrides((prev) => ({ ...prev, [key]: e.target.checked }))}
+            />
+            Poste marche public
+            <span className="wg-muted">
+              {repartitionResult?.displayedPrice !== null && repartitionResult?.displayedPrice !== undefined
+                ? `${formatEur(repartitionResult.displayedPrice)} affiche`
+                : "masque"}
+            </span>
+          </label>
+        )}
+      </div>
+    );
+  };
+
   // ---- Derives pour l'onglet "Offre" (decision 42, 12/09/2026) : rebatie sur
   // le modele des offres PDF reelles fournies par Ben. Aucune de ces valeurs
   // ne recalcule le moteur -- pur agregat d'affichage sur `lines`/`cashflow`
@@ -2005,7 +2117,7 @@ export default function App() {
                         >
                           {panels.map((p) => (
                             <option key={p.id} value={p.id}>
-                              {p.brand} {p.modelName} - {p.unitCost.toFixed(2)} EUR
+                              {p.brand} {p.modelName} - {formatEur(p.unitCost)}
                             </option>
                           ))}
                         </select>
@@ -2045,6 +2157,7 @@ export default function App() {
                           powerLabel={product?.powerW ? `${product.powerW} Wc` : undefined}
                           marginPvElectrical={marginPvElectrical}
                           marginBatteryTravel={marginBatteryTravel}
+                          actions={renderLineActions(previewLine)}
                         />
                       )}
                     </div>
@@ -2061,6 +2174,7 @@ export default function App() {
                 <p className="wg-muted" style={{ marginTop: 8 }}>
                   Total : {totalPanelQty} panneau(x) - {totalPowerKwc.toFixed(2)} kWc
                 </p>
+                <SectionSubtotal lines={pvLines} />
               </div>
             )}
 
@@ -2086,7 +2200,7 @@ export default function App() {
                         >
                           {inverters.map((p) => (
                             <option key={p.id} value={p.id}>
-                              {p.brand} {p.modelName} - {p.unitCost.toFixed(2)} EUR
+                              {p.brand} {p.modelName} - {formatEur(p.unitCost)}
                             </option>
                           ))}
                         </select>
@@ -2126,6 +2240,7 @@ export default function App() {
                           powerLabel={product?.powerKva ? `${product.powerKva} kVA` : undefined}
                           marginPvElectrical={marginPvElectrical}
                           marginBatteryTravel={marginBatteryTravel}
+                          actions={renderLineActions(previewLine)}
                         />
                       )}
                     </div>
@@ -2152,7 +2267,7 @@ export default function App() {
                       <option value="">Aucun</option>
                       {optimizers.map((o) => (
                         <option key={o.id} value={o.id}>
-                          {o.brand} (max {o.maxPowerW}W) - {o.unitPrice.toFixed(2)} EUR/u
+                          {o.brand} (max {o.maxPowerW}W) - {formatEur(o.unitPrice)}/u
                         </option>
                       ))}
                     </select>
@@ -2172,9 +2287,11 @@ export default function App() {
                       powerLabel={selectedOptimizer ? `${selectedOptimizer.maxPowerW} W` : undefined}
                       marginPvElectrical={marginPvElectrical}
                       marginBatteryTravel={marginBatteryTravel}
+                      actions={renderLineActions(optimizerLines[0])}
                     />
                   )}
                 </div>
+                <SectionSubtotal lines={[...inverterLines, ...optimizerLines]} />
               </div>
             )}
 
@@ -2209,26 +2326,103 @@ export default function App() {
                   {batteryLines.map((line, idx) => (
                     <div key={`battery-${idx}`} className="wg-calc-line-row">
                       <span>{line.description}</span>
-                      <CalcLinePreview line={line} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                      <CalcLinePreview
+                        line={line}
+                        marginPvElectrical={marginPvElectrical}
+                        marginBatteryTravel={marginBatteryTravel}
+                        actions={renderLineActions(line)}
+                      />
                     </div>
                   ))}
                 </>
               )}
+              <SectionSubtotal lines={batteryLines} />
             </div>
 
-            {/* 4. Structure de montage */}
+            {/* 4. Structure de montage -- reorganisee le 15/09/2026 (decision
+                55, demande de Ben : "cette section doit contenir les postes
+                concernant la toiture... et eventuellement la tranchee").
+                Toiture et tranchee, auparavant dans la section 6, sont
+                deplacees ici ; le carport reste bien identifie comme une
+                structure alternative optionnelle (pas la seule option de la
+                section, comme le signalait Ben : "les structures de montage
+                que tu as mises sont uniquement les carports"). Aucun calcul
+                deplace, seulement l'emplacement dans l'ecran -- les memes
+                lignes laborOptionsBySlot.toiture/tranchee qu'avant. */}
             {isComplete && (
               <div className="wg-panel">
                 <p className="wg-panel-title">
                   <span className="wg-step-badge">4</span>Structure de montage
                 </p>
+
+                <p className="wg-subsection-title" style={{ marginTop: 2, paddingTop: 0, borderTop: "none" }}>
+                  Toiture
+                </p>
+                {laborRoofRates.length > 0 && laborRoofRates.length < 6 && (
+                  <p className="wg-banner-warning">
+                    Bareme actuel limite a {laborRoofRates.length} type(s) de toiture ({laborRoofRates.map((r) => r.roofType).join(", ")}).
+                    L'Excel audite en distingue davantage (toiture inclinee en tuiles, en ardoise, en tuillettes, en panneaux
+                    sandwich/tole, toiture plate sud, toiture plate est-ouest) : il manque les tarifs (prix fixe + paliers par
+                    panneau) de ces types pour completer fidelement le bareme <code>labor_roof_rates</code>. A fournir par Ben.
+                  </p>
+                )}
+                <CalcLineHeader articleLabel="Poste" />
+                <div className="wg-calc-line-row">
+                  <div className="wg-calc-line-controls">
+                    <span className="wg-muted">Toiture :</span>
+                    <select value={roofType} onChange={(e) => setRoofType(e.target.value)}>
+                      {laborRoofRates.map((r) => (
+                        <option key={r.roofType} value={r.roofType}>
+                          {r.roofType}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.toiture}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.toiture)}
+                  />
+                </div>
+
+                <p className="wg-subsection-title">Tranchee (optionnelle)</p>
+                <div className="wg-calc-line-row">
+                  <div className="wg-calc-line-controls">
+                    <select value={trenchSoilType} onChange={(e) => setTrenchSoilType(e.target.value)}>
+                      {trenchRates.map((r) => (
+                        <option key={r.soilType} value={r.soilType}>
+                          {r.soilType}
+                        </option>
+                      ))}
+                    </select>
+                    {trenchSoilType !== NO_TRENCH_LABEL && (
+                      <input
+                        type="number"
+                        min={0}
+                        value={trenchLengthM}
+                        onChange={(e) => setTrenchLengthM(Number(e.target.value))}
+                        className="wg-input-qty"
+                        title="Longueur de tranchee (m)"
+                      />
+                    )}
+                  </div>
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.tranchee}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.tranchee)}
+                  />
+                </div>
+
+                <p className="wg-subsection-title">Structure alternative (carport, optionnel)</p>
                 <label className="wg-field" style={{ maxWidth: 360, marginBottom: 10 }}>
-                  Structure / carport (optionnelle, sinon toiture)
+                  Carport (remplace la toiture pour la pose des panneaux concernes)
                   <select value={carportConfigId} onChange={(e) => setCarportConfigId(e.target.value)}>
-                    <option value="">Aucune (toiture)</option>
+                    <option value="">Aucun</option>
                     {carportConfigs.map((c) => (
                       <option key={c.id} value={c.id}>
-                        {c.brand} {c.rowCount}x{c.placeCount} places, {c.nbPv} PV - {c.price.toFixed(2)} EUR
+                        {c.brand} {c.rowCount}x{c.placeCount} places, {c.nbPv} PV - {formatEur(c.price)}
                       </option>
                     ))}
                   </select>
@@ -2238,10 +2432,20 @@ export default function App() {
                     <CalcLineHeader articleLabel="Structure" />
                     <div className="wg-calc-line-row">
                       <span>{structureLines[0].description}</span>
-                      <CalcLinePreview line={structureLines[0]} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                      <CalcLinePreview
+                        line={structureLines[0]}
+                        marginPvElectrical={marginPvElectrical}
+                        marginBatteryTravel={marginBatteryTravel}
+                        actions={renderLineActions(structureLines[0])}
+                      />
                     </div>
                   </>
                 )}
+                <SectionSubtotal
+                  lines={[laborOptionsBySlot.toiture, laborOptionsBySlot.tranchee, ...structureLines].filter(
+                    (l): l is OfferLine => Boolean(l),
+                  )}
+                />
               </div>
             )}
 
@@ -2276,14 +2480,24 @@ export default function App() {
                     <input type="checkbox" checked={cablingComplique} onChange={(e) => setCablingComplique(e.target.checked)} />
                     Cablage complique
                   </label>
-                  <CalcLineSlot line={laborOptionsBySlot.cablageProvision} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.cablageProvision}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.cablageProvision)}
+                  />
                 </div>
                 <div className="wg-calc-line-row">
                   <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={matosAcComplique} onChange={(e) => setMatosAcComplique(e.target.checked)} />
                     Matos AC complique
                   </label>
-                  <CalcLineSlot line={laborOptionsBySlot.matosAc} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.matosAc}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.matosAc)}
+                  />
                 </div>
 
                 {cableAc.errors.map((err, idx) => (
@@ -2300,25 +2514,37 @@ export default function App() {
                     {cableAutoLines.map((line, idx) => (
                       <div key={`cabling-${idx}`} className="wg-calc-line-row">
                         <span>{line.description}</span>
-                        <CalcLinePreview line={line} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                        <CalcLinePreview
+                          line={line}
+                          marginPvElectrical={marginPvElectrical}
+                          marginBatteryTravel={marginBatteryTravel}
+                          actions={renderLineActions(line)}
+                        />
                       </div>
                     ))}
                   </>
                 )}
+                <SectionSubtotal
+                  lines={[laborOptionsBySlot.cablageProvision, laborOptionsBySlot.matosAc, ...cableAutoLines].filter(
+                    (l): l is OfferLine => Boolean(l),
+                  )}
+                />
               </div>
             )}
 
             {/* 6. Main-d'oeuvre, electricite et administratif (parite Excel
                 decisions 38/41 -- reorganise dans l'ordre des lignes 18 a 40
                 de la feuille Excel "Calcul du prix", chaque select regroupe
-                avec sa case a cocher associee). */}
+                avec sa case a cocher associee). Toiture et tranchee ont ete
+                deplacees dans la section 4 "Structure de montage" le
+                15/09/2026 (decision 55, demande de Ben). */}
             {isComplete && (
               <div className="wg-panel">
                 <p className="wg-panel-title">
                   <span className="wg-step-badge">6</span>Main-d'oeuvre, electricite et administratif
                 </p>
                 <p className="wg-muted">
-                  Parite Excel (decision 38) : main-d'oeuvre, tranchee, redevance GRD, certification electrique,
+                  Parite Excel (decision 38) : main-d'oeuvre electricien, redevance GRD, certification electrique,
                   cabine de decouplage, transformateur, compteurs, EMS, manutention et forfaits divers.
                 </p>
 
@@ -2336,51 +2562,27 @@ export default function App() {
                     demande de Ben). Un poste desactive reste visible avec des
                     "-" (CalcLineSlot / CalcLineEmpty) plutot que de disparaitre. */}
 
-                <p className="wg-subsection-title">Toiture et tranchee</p>
+                <p className="wg-subsection-title" style={{ marginTop: 2, paddingTop: 0, borderTop: "none" }}>
+                  Electricien et cabine de decouplage
+                </p>
                 <CalcLineHeader articleLabel="Poste" />
                 <div className="wg-calc-line-row">
-                  <div className="wg-calc-line-controls">
-                    <span className="wg-muted">Toiture :</span>
-                    <select value={roofType} onChange={(e) => setRoofType(e.target.value)}>
-                      {laborRoofRates.map((r) => (
-                        <option key={r.roofType} value={r.roofType}>
-                          {r.roofType}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <CalcLineSlot line={laborOptionsBySlot.toiture} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
-                </div>
-                <div className="wg-calc-line-row">
-                  <div className="wg-calc-line-controls">
-                    <span className="wg-muted">Tranchee :</span>
-                    <select value={trenchSoilType} onChange={(e) => setTrenchSoilType(e.target.value)}>
-                      {trenchRates.map((r) => (
-                        <option key={r.soilType} value={r.soilType}>
-                          {r.soilType}
-                        </option>
-                      ))}
-                    </select>
-                    {trenchSoilType !== NO_TRENCH_LABEL && (
-                      <input
-                        type="number"
-                        min={0}
-                        value={trenchLengthM}
-                        onChange={(e) => setTrenchLengthM(Number(e.target.value))}
-                        className="wg-input-qty"
-                        title="Longueur de tranchee (m)"
-                      />
-                    )}
-                  </div>
-                  <CalcLineSlot line={laborOptionsBySlot.tranchee} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
-                </div>
-                <div className="wg-calc-line-row">
                   <span className="wg-muted">Main-d'oeuvre electricien (auto, selon kVA total)</span>
-                  <CalcLineSlot line={laborOptionsBySlot.electricien} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.electricien}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.electricien)}
+                  />
                 </div>
                 <div className="wg-calc-line-row">
                   <span className="wg-muted">Cabine de decouplage (auto, au-dela de 30 kVA)</span>
-                  <CalcLineSlot line={laborOptionsBySlot.cabineDecouplage} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.cabineDecouplage}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.cabineDecouplage)}
+                  />
                 </div>
 
                 <p className="wg-subsection-title">Certifications et compteurs</p>
@@ -2394,14 +2596,24 @@ export default function App() {
                     />
                     Certification electrique
                   </label>
-                  <CalcLineSlot line={laborOptionsBySlot.certification} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.certification}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.certification)}
+                  />
                 </div>
                 <div className="wg-calc-line-row">
                   <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={greenBoxEnabled} onChange={(e) => setGreenBoxEnabled(e.target.checked)} />
                     Green Box
                   </label>
-                  <CalcLineSlot line={laborOptionsBySlot.greenBox} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.greenBox}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.greenBox)}
+                  />
                 </div>
                 {region === Region.BRUXELLES && (
                   <div className="wg-calc-line-row">
@@ -2409,7 +2621,12 @@ export default function App() {
                       <input type="checkbox" checked={brugelEnabled} onChange={(e) => setBrugelEnabled(e.target.checked)} />
                       Certification Brugel
                     </label>
-                    <CalcLineSlot line={laborOptionsBySlot.brugel} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                    <CalcLineSlot
+                      line={laborOptionsBySlot.brugel}
+                      marginPvElectrical={marginPvElectrical}
+                      marginBatteryTravel={marginBatteryTravel}
+                      actions={renderLineActions(laborOptionsBySlot.brugel)}
+                    />
                   </div>
                 )}
                 <div className="wg-calc-line-row">
@@ -2424,13 +2641,18 @@ export default function App() {
                           .filter((c) => c.modelName === "Compteur vert")
                           .map((c) => (
                             <option key={c.id} value={String(c.specs?.phase_type ?? "")}>
-                              {String(c.specs?.phase_type ?? "")} - {c.unitPrice.toFixed(2)} EUR
+                              {String(c.specs?.phase_type ?? "")} - {formatEur(c.unitPrice)}
                             </option>
                           ))}
                       </select>
                     )}
                   </div>
-                  <CalcLineSlot line={laborOptionsBySlot.compteurVert} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.compteurVert}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.compteurVert)}
+                  />
                 </div>
 
                 <p className="wg-subsection-title">Energy Meter, EMS, transformateur</p>
@@ -2447,13 +2669,18 @@ export default function App() {
                           .filter((c) => c.modelName === "Energy Meter")
                           .map((c) => (
                             <option key={c.id} value={String(c.specs?.phase_type ?? "")}>
-                              {String(c.specs?.phase_type ?? "")} - {c.unitPrice.toFixed(2)} EUR
+                              {String(c.specs?.phase_type ?? "")} - {formatEur(c.unitPrice)}
                             </option>
                           ))}
                       </select>
                     )}
                   </div>
-                  <CalcLineSlot line={laborOptionsBySlot.energyMeter} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.energyMeter}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.energyMeter)}
+                  />
                 </div>
                 <div className="wg-calc-line-row">
                   <div className="wg-calc-line-controls">
@@ -2462,12 +2689,17 @@ export default function App() {
                       <option value="">Aucun</option>
                       {emsCatalog.map((e) => (
                         <option key={e.id} value={e.id}>
-                          {e.modelName} - {e.unitPrice.toFixed(2)} EUR
+                          {e.modelName} - {formatEur(e.unitPrice)}
                         </option>
                       ))}
                     </select>
                   </div>
-                  <CalcLineSlot line={laborOptionsBySlot.ems} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.ems}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.ems)}
+                  />
                 </div>
                 {emsId && emsCatalog.find((e) => e.id === emsId)?.specs?.requires_license === true && (
                   <div className="wg-calc-line-row">
@@ -2479,7 +2711,12 @@ export default function App() {
                       />
                       Licence EMS (hors Excel actif, voir note)
                     </label>
-                    <CalcLineSlot line={laborOptionsBySlot.emsLicense} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                    <CalcLineSlot
+                      line={laborOptionsBySlot.emsLicense}
+                      marginPvElectrical={marginPvElectrical}
+                      marginBatteryTravel={marginBatteryTravel}
+                      actions={renderLineActions(laborOptionsBySlot.emsLicense)}
+                    />
                   </div>
                 )}
                 <div className="wg-calc-line-row">
@@ -2489,12 +2726,17 @@ export default function App() {
                       <option value="">Aucun</option>
                       {transformateurCatalog.map((t) => (
                         <option key={t.id} value={t.id}>
-                          {t.modelName} - {t.unitPrice.toFixed(2)} EUR
+                          {t.modelName} - {formatEur(t.unitPrice)}
                         </option>
                       ))}
                     </select>
                   </div>
-                  <CalcLineSlot line={laborOptionsBySlot.transformateur} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.transformateur}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.transformateur)}
+                  />
                 </div>
 
                 <p className="wg-subsection-title">Manutention</p>
@@ -2504,7 +2746,12 @@ export default function App() {
                     <input type="checkbox" checked={liftEnabled} onChange={(e) => setLiftEnabled(e.target.checked)} />
                     Lift
                   </label>
-                  <CalcLineSlot line={laborOptionsBySlot.lift} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.lift}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.lift)}
+                  />
                 </div>
                 <div className="wg-calc-line-row">
                   <div className="wg-calc-line-controls">
@@ -2523,14 +2770,24 @@ export default function App() {
                       />
                     )}
                   </div>
-                  <CalcLineSlot line={laborOptionsBySlot.nacelle} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.nacelle}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.nacelle)}
+                  />
                 </div>
                 <div className="wg-calc-line-row">
                   <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={enlevementEnabled} onChange={(e) => setEnlevementEnabled(e.target.checked)} />
                     Enlevement installation existante
                   </label>
-                  <CalcLineSlot line={laborOptionsBySlot.enlevement} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.enlevement}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.enlevement)}
+                  />
                 </div>
                 <div className="wg-calc-line-row">
                   <div className="wg-calc-line-controls">
@@ -2541,16 +2798,26 @@ export default function App() {
                         .filter((h) => h.handlingKey === "grue_1_jour" || h.handlingKey === "grue_manitou_semaine")
                         .map((h) => (
                           <option key={h.handlingKey} value={h.handlingKey}>
-                            {h.label} - {h.price.toFixed(2)} EUR
+                            {h.label} - {formatEur(h.price)}
                           </option>
                         ))}
                     </select>
                   </div>
-                  <CalcLineSlot line={laborOptionsBySlot.grue} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.grue}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.grue)}
+                  />
                 </div>
                 <div className="wg-calc-line-row">
                   <span className="wg-muted">Transport (auto, deduit du nombre de panneaux)</span>
-                  <CalcLineSlot line={laborOptionsBySlot.transport} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.transport}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.transport)}
+                  />
                 </div>
 
                 <p className="wg-subsection-title">Etudes complementaires</p>
@@ -2560,15 +2827,46 @@ export default function App() {
                     <input type="checkbox" checked={stabilityStudyEnabled} onChange={(e) => setStabilityStudyEnabled(e.target.checked)} />
                     Etude de stabilite
                   </label>
-                  <CalcLineSlot line={laborOptionsBySlot.stabilityStudy} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.stabilityStudy}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.stabilityStudy)}
+                  />
                 </div>
                 <div className="wg-calc-line-row">
                   <label className="wg-inline-field wg-calc-line-controls">
                     <input type="checkbox" checked={grdChargeToUs} onChange={(e) => setGrdChargeToUs(e.target.checked)} />
                     Etude GRD a notre charge
                   </label>
-                  <CalcLineSlot line={laborOptionsBySlot.grd} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                  <CalcLineSlot
+                    line={laborOptionsBySlot.grd}
+                    marginPvElectrical={marginPvElectrical}
+                    marginBatteryTravel={marginBatteryTravel}
+                    actions={renderLineActions(laborOptionsBySlot.grd)}
+                  />
                 </div>
+                <SectionSubtotal
+                  lines={[
+                    laborOptionsBySlot.electricien,
+                    laborOptionsBySlot.cabineDecouplage,
+                    laborOptionsBySlot.certification,
+                    laborOptionsBySlot.greenBox,
+                    laborOptionsBySlot.brugel,
+                    laborOptionsBySlot.compteurVert,
+                    laborOptionsBySlot.energyMeter,
+                    laborOptionsBySlot.ems,
+                    laborOptionsBySlot.emsLicense,
+                    laborOptionsBySlot.transformateur,
+                    laborOptionsBySlot.lift,
+                    laborOptionsBySlot.nacelle,
+                    laborOptionsBySlot.enlevement,
+                    laborOptionsBySlot.grue,
+                    laborOptionsBySlot.transport,
+                    laborOptionsBySlot.stabilityStudy,
+                    laborOptionsBySlot.grd,
+                  ].filter((l): l is OfferLine => Boolean(l))}
+                />
               </div>
             )}
 
@@ -2586,137 +2884,58 @@ export default function App() {
                   <CalcLineHeader articleLabel="Poste deplacement" />
                   <div className="wg-calc-line-row">
                     <span>{travelLines[0].description}</span>
-                    <CalcLinePreview line={travelLines[0]} marginPvElectrical={marginPvElectrical} marginBatteryTravel={marginBatteryTravel} />
+                    <CalcLinePreview
+                      line={travelLines[0]}
+                      marginPvElectrical={marginPvElectrical}
+                      marginBatteryTravel={marginBatteryTravel}
+                      actions={renderLineActions(travelLines[0])}
+                    />
                   </div>
                 </>
               )}
+              <SectionSubtotal lines={travelLines} />
             </div>
 
-            {/* Detail complet des lignes : table exhaustive de tous les
-                postes (y compris la surcharge manuelle de prix et le mode
-                marche public) -- deplacee en fin de page, resume des prix
-                juste apres (decision 42, 12/09/2026, demande de Ben :
-                "resume des prix... plutot en bas"). */}
-            <div className="wg-panel">
-              <p className="wg-panel-title">Detail complet des lignes</p>
-              <div className="wg-table-wrap" style={{ marginTop: 0 }}>
-                <table className="wg-sheet">
-                  <thead>
-                    <tr>
-                      <th>Ligne</th>
-                      <th className="wg-num">Qte</th>
-                      <th className="wg-num">Cout unitaire</th>
-                      <th className="wg-num">Prix unitaire</th>
-                      <th className="wg-num">Marge unitaire</th>
-                      <th className="wg-num">Marge (ligne)</th>
-                      <th className="wg-num">Total prix</th>
-                      {isPublicTender && <th>Poste ?</th>}
-                      {isPublicTender && <th className="wg-num">Prix affiche (redistribue)</th>}
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {lines.map((line, idx) => {
-                      const key = `${line.category}-${idx}`;
-                      const isOverridden = line.manuallyOverridden;
-                      const repartitionResult = repartitionResults?.[idx];
-                      const unitMargin = line.quantity ? line.marginAppliedAmount / line.quantity : 0;
-                      return (
-                        <tr key={key} className={isOverridden ? "wg-row-edited" : undefined}>
-                          <td>{line.description}</td>
-                          <td className="wg-num">{line.quantity}</td>
-                          <td className="wg-num">{line.unitCost.toFixed(2)} EUR</td>
-                          <td className="wg-num">
-                            {line.unitPrice.toFixed(2)} EUR
-                            {isOverridden && <span className="wg-badge wg-badge-modified">modifie</span>}
-                          </td>
-                          <td className="wg-num">{unitMargin.toFixed(2)} EUR</td>
-                          <td className="wg-num">{line.marginAppliedAmount.toFixed(2)} EUR</td>
-                          <td className="wg-num">{lineTotalPrice(line).toFixed(2)} EUR</td>
-                          {isPublicTender && (
-                            <td>
-                              <input
-                                type="checkbox"
-                                checked={line.repartitionPoste}
-                                onChange={(e) => setRepartitionOverrides((prev) => ({ ...prev, [key]: e.target.checked }))}
-                              />
-                            </td>
-                          )}
-                          {isPublicTender && (
-                            <td className="wg-num">
-                              {repartitionResult?.displayedPrice !== null && repartitionResult?.displayedPrice !== undefined
-                                ? `${repartitionResult.displayedPrice.toFixed(2)} EUR`
-                                : "masque"}
-                            </td>
-                          )}
-                          <td style={{ whiteSpace: "nowrap" }}>
-                            <button
-                              onClick={() => {
-                                const value = window.prompt("Nouveau prix unitaire (EUR) :", line.unitPrice.toFixed(2));
-                                if (value === null) return;
-                                const parsed = Number(value);
-                                if (!Number.isNaN(parsed)) {
-                                  setOverriddenLines((prev) => ({ ...prev, [key]: parsed }));
-                                }
-                              }}
-                            >
-                              Modifier le prix
-                            </button>
-                            {isOverridden && (
-                              <button
-                                style={{ marginLeft: 6 }}
-                                onClick={() =>
-                                  setOverriddenLines((prev) => {
-                                    const next = { ...prev };
-                                    delete next[key];
-                                    return next;
-                                  })
-                                }
-                              >
-                                Annuler
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+            {/* Le tableau "Detail complet des lignes", auparavant une section a
+                part entiere en bas de page, a ete supprime le 15/09/2026
+                (decision 55, demande de Ben : "la section detail complet des
+                lignes ne doit pas etre une section a part entiere en bas").
+                Chaque ligne reste modifiable (bouton "Modifier le prix") et,
+                en mode marche public, redistribuable (case "Poste marche
+                public") directement depuis sa section d'origine (1 a 7)
+                ci-dessus, via renderLineActions -- aucune capacite perdue,
+                juste deplacee au plus pres de chaque poste. */}
 
             {totals && (
               <div className="wg-panel wg-totals">
                 <p className="wg-panel-title">Resume des prix</p>
-                <div className="wg-totals-row">
+                <div className="wg-totals-row wg-total-main">
                   <span>Prix client (TTC)</span>
-                  <span>{totals.totalTtc.toFixed(2)} EUR</span>
-                </div>
-                <div className="wg-totals-row">
-                  <span>Prix HTVA</span>
-                  <span>{totals.totalHtva.toFixed(2)} EUR</span>
+                  <span>{formatEur(totals.totalTtc)}</span>
                 </div>
                 <div className="wg-totals-row">
                   <span>Prix HTVA avec batterie</span>
-                  <span>{totals.totalHtva.toFixed(2)} EUR</span>
-                </div>
-                <div className="wg-totals-row">
-                  <span>Prix HTVA sans batterie</span>
-                  <span>{totalsWithoutBattery ? `${totalsWithoutBattery.totalHtva.toFixed(2)} EUR` : "-"}</span>
-                </div>
-                <div className="wg-totals-row">
-                  <span>Prix/Wc HTVA sans batterie</span>
                   <span>
-                    {totalPowerKwc > 0 && totalsWithoutBattery
-                      ? `${(totalsWithoutBattery.totalHtva / (totalPowerKwc * 1000)).toFixed(3)} EUR/Wc`
-                      : "-"}
+                    {formatEur(totals.totalHtva)}
+                    {totalPowerKwc > 0 && (
+                      <span className="wg-muted" style={{ marginLeft: 8, fontWeight: 400 }}>
+                        ({(totals.totalHtva / (totalPowerKwc * 1000)).toFixed(3)} EUR/Wc)
+                      </span>
+                    )}
                   </span>
                 </div>
                 <div className="wg-totals-row">
-                  <span>Prix/Wc HTVA avec batterie</span>
-                  <span>{totalPowerKwc > 0 ? `${(totals.totalHtva / (totalPowerKwc * 1000)).toFixed(3)} EUR/Wc` : "-"}</span>
+                  <span>Prix HTVA sans batterie</span>
+                  <span>
+                    {totalsWithoutBattery ? formatEur(totalsWithoutBattery.totalHtva) : "-"}
+                    {totalPowerKwc > 0 && totalsWithoutBattery && (
+                      <span className="wg-muted" style={{ marginLeft: 8, fontWeight: 400 }}>
+                        ({(totalsWithoutBattery.totalHtva / (totalPowerKwc * 1000)).toFixed(3)} EUR/Wc)
+                      </span>
+                    )}
+                  </span>
                 </div>
-                <div className="wg-totals-row wg-total-main">
+                <div className="wg-totals-row">
                   <span>Prix/Wc TTC</span>
                   <span>{totalPowerKwc > 0 ? `${(totals.totalTtc / (totalPowerKwc * 1000)).toFixed(3)} EUR/Wc` : "-"}</span>
                 </div>

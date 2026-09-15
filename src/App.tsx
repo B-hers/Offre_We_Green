@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabaseConfigured } from "./supabaseClient";
 import { useSupabaseAuth } from "./useAuth";
 import LoginPanel from "./components/LoginPanel";
@@ -34,7 +34,16 @@ import {
   fetchFlatFeeOptions,
   fetchMiscCalculationParameter,
   fetchElecComponentsByType,
+  productDatasheetUrl,
 } from "./data/catalog";
+import {
+  loadArcheliosPdf,
+  renderPageToDataUrl,
+  detectAndRenderCalepinage,
+  ArcheliosPdfError,
+  type ArcheliosPdfDocument,
+  type ArcheliosSourceType,
+} from "./pdf/archeliosPdf";
 import { Region, RevenueRegime, newOfferLine, lineTotalPrice, lineTotalCost } from "./engine/types";
 import type {
   Product,
@@ -80,7 +89,14 @@ import {
   transportTripsForPanels,
 } from "./engine/laborEngine";
 import { OFFER_LITERATURE_COMPLETE, OFFER_LITERATURE_BATTERY, WE_GREEN_COMPANY_INFO } from "./content/offerLiterature";
-import { importOdooQuote, OdooImportError, type OdooImportResult, type OdooAddress } from "./data/odooImport";
+import {
+  importOdooQuote,
+  OdooImportError,
+  type OdooImportResult,
+  type OdooAddress,
+  type OdooArticles,
+  type OdooArticle,
+} from "./data/odooImport";
 
 /**
  * Selection generique d'un produit + quantite, utilisee pour les panneaux PV
@@ -101,6 +117,162 @@ let selectionKeySeq = 0;
 function nextSelectionKey(): string {
   selectionKeySeq += 1;
   return `sel-${selectionKeySeq}`;
+}
+
+/**
+ * Formatage des montants EUR affiches dans l'offre client (decision 54,
+ * 15/09/2026, demande de Ben : "un separateur des milliers pour que ce soit
+ * plus digeste et plus lisible"). Convention belge francophone : espace
+ * fine insecable comme separateur de milliers, virgule comme separateur
+ * decimal (ex. "12 345,67 EUR"). Formateur unique reutilise, pas
+ * reinstancie a chaque appel.
+ */
+const EUR_FORMATTER = new Intl.NumberFormat("fr-BE", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function formatEur(value: number): string {
+  return `${EUR_FORMATTER.format(value)} EUR`;
+}
+
+/**
+ * Rapprochement des articles Odoo (BDC = devis client confirme, sale.order,
+ * decision 49) avec le catalogue de l'offre, pour pre-remplir "Calcul du
+ * prix" (panneaux/onduleurs/batterie) sans ressaisie manuelle. Best-effort,
+ * aucune table de correspondance codee en dur : panneaux rapproches par
+ * puissance crete (Wc, tolerance 5%), onduleurs et batteries par texte
+ * normalise (libelle Odoo vs marque+modele catalogue), batterie egalement
+ * par capacite kWh quand elle est lisible dans le libelle catalogue. Tout
+ * article sans correspondance fiable est renvoye a part (jamais ignore
+ * silencieusement) pour que l'utilisateur l'ajoute lui-meme. Decision 50,
+ * 15/09/2026.
+ */
+function normalizeMatchText(text: string): string {
+  return text
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function findPanelByPower(article: OdooArticle, catalog: Product[]): Product | null {
+  if (!article.wc) return findByLabel(article, catalog);
+  let best: Product | null = null;
+  let bestDiff = Infinity;
+  for (const p of catalog) {
+    if (!p.powerW) continue;
+    const diff = Math.abs(p.powerW - article.wc);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = p;
+    }
+  }
+  if (best && best.powerW && bestDiff / article.wc <= 0.05) return best;
+  return findByLabel(article, catalog);
+}
+
+function findByLabel(article: OdooArticle, catalog: Product[]): Product | null {
+  const needle = normalizeMatchText(article.produit ?? "");
+  if (!needle) return null;
+  let best: Product | null = null;
+  let bestScore = 0;
+  for (const p of catalog) {
+    const hay = normalizeMatchText(`${p.brand} ${p.modelName}`);
+    if (!hay) continue;
+    let score = 0;
+    if (needle.includes(hay) || hay.includes(needle)) {
+      score = Math.min(hay.length, needle.length);
+    } else {
+      const hayTokens = hay.split(" ").filter((t) => t.length > 2);
+      const matchedTokens = hayTokens.filter((t) => needle.includes(t));
+      if (hayTokens.length > 0 && matchedTokens.length >= Math.max(1, Math.ceil(hayTokens.length * 0.6))) {
+        score = matchedTokens.join("").length;
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = p;
+    }
+  }
+  return best;
+}
+
+function findBatteryByKwh(article: OdooArticle, catalog: Product[]): Product | null {
+  if (article.kwh != null) {
+    let best: Product | null = null;
+    let bestDiff = Infinity;
+    for (const p of catalog) {
+      const match = `${p.brand} ${p.modelName}`.match(/(\d+(?:[.,]\d+)?)\s*kWh/i);
+      const kwh = match ? Number(match[1].replace(",", ".")) : null;
+      if (kwh == null) continue;
+      const diff = Math.abs(kwh - article.kwh);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = p;
+      }
+    }
+    if (best && bestDiff <= 0.5) return best;
+  }
+  return findByLabel(article, catalog);
+}
+
+interface OdooArticleMatchResult {
+  panelSelections: ProductSelection[];
+  inverterSelections: ProductSelection[];
+  batteryId: string;
+  unmatched: string[];
+}
+
+function matchOdooArticlesToCatalog(
+  articles: OdooArticles,
+  panels: Product[],
+  inverters: Product[],
+  batteries: Product[],
+): OdooArticleMatchResult {
+  const unmatched: string[] = [];
+
+  const panelSelections: ProductSelection[] = [];
+  for (const art of articles.panneaux) {
+    const product = findPanelByPower(art, panels);
+    if (product) {
+      const existing = panelSelections.find((s) => s.productId === product.id);
+      if (existing) existing.qty += art.quantite;
+      else panelSelections.push({ key: nextSelectionKey(), productId: product.id, qty: art.quantite });
+    } else {
+      unmatched.push(
+        `Panneau "${art.produit ?? "?"}" (${art.quantite} pcs${art.wc ? `, ${art.wc} Wc` : ""}) : aucune correspondance dans le catalogue.`,
+      );
+    }
+  }
+
+  const inverterSelections: ProductSelection[] = [];
+  for (const art of articles.onduleurs) {
+    const product = findByLabel(art, inverters);
+    if (product) {
+      const existing = inverterSelections.find((s) => s.productId === product.id);
+      if (existing) existing.qty += art.quantite;
+      else inverterSelections.push({ key: nextSelectionKey(), productId: product.id, qty: art.quantite });
+    } else {
+      unmatched.push(`Onduleur "${art.produit ?? "?"}" (${art.quantite}) : aucune correspondance dans le catalogue.`);
+    }
+  }
+
+  let batteryId = "";
+  if (articles.batteries.length > 0) {
+    const art = articles.batteries[0];
+    const product = findBatteryByKwh(art, batteries);
+    if (product) batteryId = product.id;
+    else unmatched.push(`Batterie "${art.produit ?? "?"}" : aucune correspondance dans le catalogue.`);
+    if (articles.batteries.length > 1) {
+      unmatched.push(`${articles.batteries.length - 1} ligne(s) batterie supplementaire(s) ignoree(s) (une seule batterie geree par offre).`);
+    }
+  }
+
+  if (articles.autres.length > 0) {
+    unmatched.push(
+      `${articles.autres.length} ligne(s) non classee(s) par Odoo (ni panneau, ni onduleur, ni batterie, ni borne) : a ajouter manuellement si pertinent.`,
+    );
+  }
+
+  return { panelSelections, inverterSelections, batteryId, unmatched };
 }
 
 /**
@@ -447,6 +619,126 @@ export default function App() {
   const [odooLoading, setOdooLoading] = useState(false);
   const [odooError, setOdooError] = useState<string | null>(null);
   const [odooResult, setOdooResult] = useState<OdooImportResult | null>(null);
+  // Confirmation d'ecrasement avant d'appliquer les articles Odoo dans
+  // "Calcul du prix" (decision 50, 15/09/2026, demande explicite de Ben :
+  // "si articles deja existants, mettre un pop up ou un bouton demandant si
+  // on veut ecraser les marchandises existantes"). Pas de window.confirm
+  // natif : on reste sur le pattern d'alerte deja utilise dans l'app
+  // (wg-banner-warning), avec un bouton de confirmation explicite.
+  const [odooOverwriteConfirm, setOdooOverwriteConfirm] = useState(false);
+  const [odooApplyMessage, setOdooApplyMessage] = useState<string | null>(null);
+
+  // Responsable / PM We Green (decision 50, 15/09/2026) : contrairement a la
+  // version precedente (affichage informatif uniquement dans le panneau
+  // d'import Odoo), c'est desormais un champ reel de l'offre, pre-rempli par
+  // l'import mais modifiable et repris dans l'onglet "Offre" -- sur le meme
+  // principe que la fiche client (clientName/clientAddress ci-dessus).
+  const [responsableNom, setResponsableNom] = useState<string>("");
+  const [responsableTelephone, setResponsableTelephone] = useState<string>("");
+  const [responsableEmail, setResponsableEmail] = useState<string>("");
+
+  // Import Archelios / Helioscope (decision 53/54, chantier 4 de la roadmap
+  // de la decision 49) : extraction cote client (pdf.js, voir
+  // src/pdf/archeliosPdf.ts) de l'image de calepinage/implantation depuis le
+  // rapport PDF, pour l'inserer dans l'offre. Rien n'est envoye a un
+  // serveur. Detection automatique de la page par defaut (decision 54,
+  // algorithme repris du Briefing de chantier existant, a la demande de
+  // Ben), avec un navigateur manuel de secours si la detection se trompe.
+  const archeliosDocRef = useRef<ArcheliosPdfDocument | null>(null);
+  const [archeliosFilename, setArcheliosFilename] = useState<string | null>(null);
+  const [archeliosNumPages, setArcheliosNumPages] = useState(0);
+  const [archeliosCurrentPage, setArcheliosCurrentPage] = useState(1);
+  const [archeliosPreviewDataUrl, setArcheliosPreviewDataUrl] = useState<string | null>(null);
+  const [archeliosBrowsing, setArcheliosBrowsing] = useState(false);
+  const [archeliosLoading, setArcheliosLoading] = useState(false);
+  const [archeliosError, setArcheliosError] = useState<string | null>(null);
+  const [archeliosImage, setArcheliosImage] = useState<{
+    dataUrl: string;
+    sourceFilename: string;
+    pageNumber: number;
+    numPages: number;
+    sourceType: ArcheliosSourceType;
+    auto: boolean;
+  } | null>(null);
+
+  function removeArcheliosImage() {
+    archeliosDocRef.current = null;
+    setArcheliosFilename(null);
+    setArcheliosNumPages(0);
+    setArcheliosCurrentPage(1);
+    setArcheliosPreviewDataUrl(null);
+    setArcheliosBrowsing(false);
+    setArcheliosError(null);
+    setArcheliosImage(null);
+  }
+
+  async function handleArcheliosFile(file: File) {
+    setArcheliosError(null);
+    setArcheliosLoading(true);
+    setArcheliosBrowsing(false);
+    try {
+      const doc = await loadArcheliosPdf(file);
+      const result = await detectAndRenderCalepinage(doc);
+      archeliosDocRef.current = doc;
+      setArcheliosFilename(file.name);
+      setArcheliosNumPages(result.numPages);
+      setArcheliosCurrentPage(result.pageNumber);
+      setArcheliosImage({
+        dataUrl: result.dataUrl,
+        sourceFilename: file.name,
+        pageNumber: result.pageNumber,
+        numPages: result.numPages,
+        sourceType: result.sourceType,
+        auto: true,
+      });
+    } catch (err) {
+      archeliosDocRef.current = null;
+      setArcheliosFilename(null);
+      setArcheliosNumPages(0);
+      setArcheliosImage(null);
+      setArcheliosError(err instanceof ArcheliosPdfError ? err.message : "Erreur inattendue lors de la lecture du PDF.");
+    } finally {
+      setArcheliosLoading(false);
+    }
+  }
+
+  function openArcheliosBrowser() {
+    if (!archeliosDocRef.current) return;
+    setArcheliosError(null);
+    setArcheliosCurrentPage(archeliosImage?.pageNumber ?? 1);
+    setArcheliosPreviewDataUrl(archeliosImage?.dataUrl ?? null);
+    setArcheliosBrowsing(true);
+  }
+
+  async function goToArcheliosPage(pageNumber: number) {
+    if (!archeliosDocRef.current || pageNumber < 1 || pageNumber > archeliosNumPages) return;
+    setArcheliosLoading(true);
+    setArcheliosError(null);
+    try {
+      const dataUrl = await renderPageToDataUrl(archeliosDocRef.current, pageNumber);
+      setArcheliosCurrentPage(pageNumber);
+      setArcheliosPreviewDataUrl(dataUrl);
+    } catch (err) {
+      setArcheliosError(
+        err instanceof ArcheliosPdfError ? err.message : "Erreur inattendue lors de l'affichage de cette page.",
+      );
+    } finally {
+      setArcheliosLoading(false);
+    }
+  }
+
+  function confirmArcheliosBrowsedPage() {
+    if (!archeliosPreviewDataUrl || !archeliosFilename) return;
+    setArcheliosImage({
+      dataUrl: archeliosPreviewDataUrl,
+      sourceFilename: archeliosFilename,
+      pageNumber: archeliosCurrentPage,
+      numPages: archeliosNumPages,
+      sourceType: archeliosImage?.sourceType ?? "PDF",
+      auto: false,
+    });
+    setArcheliosBrowsing(false);
+  }
 
   function formatOdooAddress(address: OdooAddress | null): string {
     if (!address) return "";
@@ -470,6 +762,8 @@ export default function App() {
   async function handleImportOdoo() {
     setOdooLoading(true);
     setOdooError(null);
+    setOdooOverwriteConfirm(false);
+    setOdooApplyMessage(null);
     try {
       const result = await importOdooQuote(odooReference);
       setOdooResult(result);
@@ -478,11 +772,60 @@ export default function App() {
         setClientAddress(formatOdooAddress(result.adresseFacturation ?? result.client));
         setClientType(result.client.estSociete ? "societe" : "particulier");
       }
+      if (result.responsable) {
+        setResponsableNom(result.responsable.nom ?? "");
+        setResponsableTelephone(result.responsable.telephone ?? "");
+        setResponsableEmail(result.responsable.email ?? "");
+      }
     } catch (err) {
       setOdooResult(null);
       setOdooError(err instanceof OdooImportError ? err.message : "Erreur inattendue lors de l'import Odoo.");
     } finally {
       setOdooLoading(false);
+    }
+  }
+
+  // Rapprochement Odoo -> catalogue, recalcule uniquement quand le devis
+  // importe ou les catalogues changent (pas a chaque rendu) : sert a la fois
+  // a l'apercu affiche dans le panneau d'import et a l'application reelle
+  // (applyOdooArticlesToCalcul ci-dessous), pour garantir que l'un et
+  // l'autre montrent exactement le meme rapprochement.
+  const odooArticleMatch = useMemo(
+    () => (odooResult ? matchOdooArticlesToCatalog(odooResult.articles, panels, inverters, batteries) : null),
+    [odooResult, panels, inverters, batteries],
+  );
+
+  /**
+   * Applique les articles Odoo rapproches (odooArticleMatch) dans "Calcul du
+   * prix" : remplace panelSelections/inverterSelections/batteryId. Decision
+   * 50 : n'est jamais appelee directement depuis un select non vide sans
+   * confirmation prealable -- voir odooOverwriteConfirm et le bouton
+   * correspondant dans l'onglet "Donnees".
+   */
+  function applyOdooArticlesToCalcul() {
+    if (!odooArticleMatch) return;
+    const match = odooArticleMatch;
+    if (match.panelSelections.length > 0) setPanelSelections(match.panelSelections);
+    if (match.inverterSelections.length > 0) setInverterSelections(match.inverterSelections);
+    if (match.batteryId) setBatteryId(match.batteryId);
+    const applied: string[] = [];
+    if (match.panelSelections.length > 0) applied.push(`${match.panelSelections.length} modele(s) de panneau`);
+    if (match.inverterSelections.length > 0) applied.push(`${match.inverterSelections.length} modele(s) d'onduleur`);
+    if (match.batteryId) applied.push("1 batterie");
+    setOdooApplyMessage(
+      applied.length > 0
+        ? `Applique dans "Calcul du prix" : ${applied.join(", ")}.${match.unmatched.length ? " Voir les articles non rapproches ci-dessous." : ""}`
+        : "Aucun article rapproche automatiquement au catalogue -- rien n'a ete applique.",
+    );
+    setOdooOverwriteConfirm(false);
+  }
+
+  function handleUseOdooArticlesClick() {
+    const hasExisting = panelSelections.some((s) => s.qty > 0) || inverterSelections.some((s) => s.qty > 0) || Boolean(batteryId);
+    if (hasExisting) {
+      setOdooOverwriteConfirm(true);
+    } else {
+      applyOdooArticlesToCalcul();
     }
   }
   const [repartitionOverrides, setRepartitionOverrides] = useState<Record<string, boolean>>({});
@@ -553,6 +896,38 @@ export default function App() {
   // modifiables) d'abord, puis Calcul du prix, puis Offre.
   const [activeTab, setActiveTab] = useState<"donnees" | "calcul" | "offre" | "backoffice">("donnees");
   const [offerMode, setOfferMode] = useState<"complete" | "batterie">("complete");
+  // Export PDF de l'offre (decision 51, 15/09/2026, point 2 de la decision 49
+  // -- "pouvoir exporter l'offre en PDF", en s'inspirant visuellement de
+  // l'offre PDF reelle de Ben) : s'appuie sur l'impression navigateur
+  // ("Enregistrer en PDF"), avec une feuille de style @media print dediee
+  // (styles.css) qui reprend la mise en page de l'onglet "Offre" -- pas de
+  // bibliotheque PDF supplementaire, la source du document imprime est la
+  // meme que celle affichee a l'ecran (jamais deux templates a maintenir).
+  // Si un autre onglet est actif au moment du clic, on bascule d'abord sur
+  // "Offre" puis on attend son rendu avant d'ouvrir l'impression.
+  const [pendingPrint, setPendingPrint] = useState(false);
+
+  // Attend que l'onglet "Offre" soit effectivement rendu (changement
+  // d'activeTab asynchrone) avant d'ouvrir la boite de dialogue d'impression
+  // -- sinon window.print() capturerait encore le contenu de l'onglet
+  // precedent.
+  useEffect(() => {
+    if (pendingPrint && activeTab === "offre") {
+      setPendingPrint(false);
+      const id = requestAnimationFrame(() => window.print());
+      return () => cancelAnimationFrame(id);
+    }
+  }, [pendingPrint, activeTab]);
+
+  function handleExportPdf() {
+    if (activeTab !== "offre") {
+      setActiveTab("offre");
+      setPendingPrint(true);
+    } else {
+      window.print();
+    }
+  }
+
   const { session, authLoading, signOut } = useSupabaseAuth();
   const [selectedAdminTable, setSelectedAdminTable] = useState<string>(ADMIN_TABLES[0]?.id ?? ADMIN_TABLES[0]?.table ?? "");
 
@@ -1599,6 +1974,9 @@ export default function App() {
             onChange={(e) => setOfferMode(e.target.checked ? "batterie" : "complete")}
           />
           Offre batterie uniquement
+          <button type="button" className="wg-btn-primary" style={{ marginLeft: 4 }} onClick={handleExportPdf}>
+            Exporter en PDF
+          </button>
         </label>
       </nav>
 
@@ -1649,6 +2027,17 @@ export default function App() {
                         >
                           Retirer
                         </button>
+                        {product?.datasheetPath && (
+                          <a
+                            href={productDatasheetUrl(product.datasheetPath) ?? undefined}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="wg-btn-link"
+                            style={{ fontSize: 12 }}
+                          >
+                            Fiche technique (PDF)
+                          </a>
+                        )}
                       </div>
                       {previewLine && (
                         <CalcLinePreview
@@ -1719,6 +2108,17 @@ export default function App() {
                         >
                           Retirer
                         </button>
+                        {product?.datasheetPath && (
+                          <a
+                            href={productDatasheetUrl(product.datasheetPath) ?? undefined}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="wg-btn-link"
+                            style={{ fontSize: 12 }}
+                          >
+                            Fiche technique (PDF)
+                          </a>
+                        )}
                       </div>
                       {previewLine && (
                         <CalcLinePreview
@@ -1794,6 +2194,15 @@ export default function App() {
                   ))}
                 </select>
               </label>
+              {(() => {
+                const selectedBattery = batteries.find((p) => p.id === batteryId);
+                const url = selectedBattery ? productDatasheetUrl(selectedBattery.datasheetPath) : null;
+                return url ? (
+                  <a href={url} target="_blank" rel="noreferrer" className="wg-btn-link" style={{ fontSize: 12, display: "inline-block", marginBottom: 10 }}>
+                    Fiche technique (PDF)
+                  </a>
+                ) : null;
+              })()}
               {batteryLines.length > 0 && (
                 <>
                   <CalcLineHeader articleLabel="Poste batterie (decompose, decision 40)" />
@@ -2385,7 +2794,13 @@ export default function App() {
               </label>
               {totals && (
                 <p className="wg-muted" style={{ marginTop: 10, fontWeight: 700 }}>
-                  Marge totale We Green : {totals.totalMargin.toFixed(2)} EUR
+                  Marge totale We Green : {formatEur(totals.totalMargin)}
+                  <br />
+                  Commission ({(commissionRate * 100).toFixed(0)}%) : {formatEur(totals.commission)}
+                  <br />
+                  <em style={{ fontWeight: 400 }}>
+                    Information interne, jamais reprise dans l'offre envoyee au client (decision 54).
+                  </em>
                 </p>
               )}
             </div>
@@ -2443,11 +2858,18 @@ export default function App() {
                   {clientType === "societe" ? "Societe" : "Particulier"} · Offre en{" "}
                   {offerLanguage === "NL" ? "neerlandais" : "francais"}
                 </p>
+                {responsableNom && (
+                  <p className="wg-muted">
+                    Responsable We Green : {responsableNom}
+                    {responsableTelephone ? ` · ${responsableTelephone}` : ""}
+                    {responsableEmail ? ` · ${responsableEmail}` : ""}
+                  </p>
+                )}
               </div>
               {totals && (
                 <div className="wg-offer-cover-price">
                   <p className="wg-offer-price-label">Prix (HTVA)</p>
-                  <p className="wg-offer-price-value">{totals.totalHtva.toFixed(2)} EUR</p>
+                  <p className="wg-offer-price-value">{formatEur(totals.totalHtva)}</p>
                   <p className="wg-muted">Retour sur investissement : {paybackYear ? `annee ${paybackYear}` : "au-dela de 25 ans"}</p>
                   <p className="wg-muted">Date : {new Date().toLocaleDateString("fr-BE")}</p>
                   <p className="wg-muted">Validite de l'offre : {OFFER_LITERATURE_COMPLETE.validiteOffre}</p>
@@ -2483,6 +2905,12 @@ export default function App() {
               </>
             ) : (
               <p>{OFFER_LITERATURE_BATTERY.description}</p>
+            )}
+
+            {archeliosImage && (
+              <div className="wg-offer-archelios-image">
+                <img src={archeliosImage.dataUrl} alt="Calepinage / implantation photovoltaique (Archelios / Helioscope)" />
+              </div>
             )}
 
             <p className="wg-subsection-title">2.2 Choix des composants</p>
@@ -2575,14 +3003,14 @@ export default function App() {
             {totals && (
               <p>
                 <strong>
-                  Le prix total de votre projet s'eleve a {totals.totalHtva.toFixed(2)} EUR HTVA ({totals.totalTtc.toFixed(2)} EUR TTC).
+                  Le prix total de votre projet s'eleve a {formatEur(totals.totalHtva)} HTVA ({formatEur(totals.totalTtc)} TTC).
                 </strong>
               </p>
             )}
             <p className="wg-muted">{OFFER_LITERATURE_COMPLETE.mentionTva}</p>
 
             {!isPublicTender && (
-              <label className="wg-inline-field" style={{ marginTop: 10 }}>
+              <label className="wg-inline-field wg-print-hide" style={{ marginTop: 10 }}>
                 Niveau de detail affiche (usage interne)
                 <select
                   value={priceDetailLevel}
@@ -2609,7 +3037,7 @@ export default function App() {
                     {categorySubtotals.map((c) => (
                       <tr key={c.category}>
                         <td>{c.category}</td>
-                        <td className="wg-num">{c.totalPrice.toFixed(2)} EUR</td>
+                        <td className="wg-num">{formatEur(c.totalPrice)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -2634,15 +3062,15 @@ export default function App() {
                       const displayed =
                         isPublicTender && repartitionResult
                           ? repartitionResult.displayedPrice !== null
-                            ? `${repartitionResult.displayedPrice.toFixed(2)} EUR`
+                            ? formatEur(repartitionResult.displayedPrice)
                             : "masque"
-                          : `${line.unitPrice.toFixed(2)} EUR`;
+                          : formatEur(line.unitPrice);
                       return (
                         <tr key={`${line.category}-${idx}`}>
                           <td>{line.description}</td>
                           <td className="wg-num">{line.quantity}</td>
                           <td className="wg-num">{displayed}</td>
-                          <td className="wg-num">{lineTotalPrice(line).toFixed(2)} EUR</td>
+                          <td className="wg-num">{formatEur(lineTotalPrice(line))}</td>
                         </tr>
                       );
                     })}
@@ -2651,31 +3079,23 @@ export default function App() {
               </div>
             )}
 
+            {/* Uniquement les totaux client (decision 54, 15/09/2026) : "Cout total",
+                "Marge totale" et "Commission" sont des informations internes,
+                jamais destinees a un document client -- deplacees dans le
+                panneau "Marge et commission" de l'onglet "Calcul du prix". */}
             {totals && (
               <div className="wg-panel wg-totals" style={{ marginTop: 14 }}>
                 <div className="wg-totals-row">
-                  <span>Cout total</span>
-                  <span>{totals.totalCost.toFixed(2)} EUR</span>
-                </div>
-                <div className="wg-totals-row">
-                  <span>Marge totale</span>
-                  <span>{totals.totalMargin.toFixed(2)} EUR</span>
-                </div>
-                <div className="wg-totals-row">
-                  <span>Commission ({(commissionRate * 100).toFixed(0)}%)</span>
-                  <span>{totals.commission.toFixed(2)} EUR</span>
-                </div>
-                <div className="wg-totals-row">
                   <span>Total HTVA</span>
-                  <span>{totals.totalHtva.toFixed(2)} EUR</span>
+                  <span>{formatEur(totals.totalHtva)}</span>
                 </div>
                 <div className="wg-totals-row">
                   <span>TVA ({(vatRate * 100).toFixed(0)}%)</span>
-                  <span>{totals.vatAmount.toFixed(2)} EUR</span>
+                  <span>{formatEur(totals.vatAmount)}</span>
                 </div>
                 <div className="wg-totals-row wg-total-main">
                   <span>Total TTC</span>
-                  <span>{totals.totalTtc.toFixed(2)} EUR</span>
+                  <span>{formatEur(totals.totalTtc)}</span>
                 </div>
               </div>
             )}
@@ -2733,21 +3153,21 @@ export default function App() {
                   <tbody>
                     <tr>
                       <td>Revenus lies a l'auto-consommation</td>
-                      <td className="wg-num">{revenueSummary1An ? `${revenueSummary1An.auto.toFixed(2)} EUR` : "-"}</td>
-                      <td className="wg-num">{revenueSummary10Ans ? `${revenueSummary10Ans.auto.toFixed(2)} EUR` : "-"}</td>
-                      <td className="wg-num">{revenueSummary25Ans ? `${revenueSummary25Ans.auto.toFixed(2)} EUR` : "-"}</td>
+                      <td className="wg-num">{revenueSummary1An ? formatEur(revenueSummary1An.auto) : "-"}</td>
+                      <td className="wg-num">{revenueSummary10Ans ? formatEur(revenueSummary10Ans.auto) : "-"}</td>
+                      <td className="wg-num">{revenueSummary25Ans ? formatEur(revenueSummary25Ans.auto) : "-"}</td>
                     </tr>
                     <tr>
                       <td>Revente energie non auto-consommee (ou CV a Bruxelles)</td>
-                      <td className="wg-num">{revenueSummary1An ? `${revenueSummary1An.specific.toFixed(2)} EUR` : "-"}</td>
-                      <td className="wg-num">{revenueSummary10Ans ? `${revenueSummary10Ans.specific.toFixed(2)} EUR` : "-"}</td>
-                      <td className="wg-num">{revenueSummary25Ans ? `${revenueSummary25Ans.specific.toFixed(2)} EUR` : "-"}</td>
+                      <td className="wg-num">{revenueSummary1An ? formatEur(revenueSummary1An.specific) : "-"}</td>
+                      <td className="wg-num">{revenueSummary10Ans ? formatEur(revenueSummary10Ans.specific) : "-"}</td>
+                      <td className="wg-num">{revenueSummary25Ans ? formatEur(revenueSummary25Ans.specific) : "-"}</td>
                     </tr>
                     <tr className="wg-row-new">
                       <td>Revenus totaux effectues</td>
-                      <td className="wg-num">{revenueSummary1An ? `${revenueSummary1An.total.toFixed(2)} EUR` : "-"}</td>
-                      <td className="wg-num">{revenueSummary10Ans ? `${revenueSummary10Ans.total.toFixed(2)} EUR` : "-"}</td>
-                      <td className="wg-num">{revenueSummary25Ans ? `${revenueSummary25Ans.total.toFixed(2)} EUR` : "-"}</td>
+                      <td className="wg-num">{revenueSummary1An ? formatEur(revenueSummary1An.total) : "-"}</td>
+                      <td className="wg-num">{revenueSummary10Ans ? formatEur(revenueSummary10Ans.total) : "-"}</td>
+                      <td className="wg-num">{revenueSummary25Ans ? formatEur(revenueSummary25Ans.total) : "-"}</td>
                     </tr>
                     <tr>
                       <td>Retour sur investissement (ROI)</td>
@@ -2766,7 +3186,7 @@ export default function App() {
 
               <p className="wg-subsection-title">5.2 Tableau de rentabilite detaille ({regimeLabel})</p>
               <p className="wg-muted">
-                Investissement (Total HTVA) : <strong>{totals?.totalHtva.toFixed(2)} EUR</strong>
+                Investissement (Total HTVA) : <strong>{totals ? formatEur(totals.totalHtva) : "-"}</strong>
                 {" · "}
                 Auto-consommation utilisee : {(effectiveAutoConsumption * 100).toFixed(0)}%
               </p>
@@ -2791,10 +3211,10 @@ export default function App() {
                         <td className="wg-num">{y.yieldPct.toFixed(1)}%</td>
                         <td className="wg-num">{y.productionKwh.toFixed(0)}</td>
                         <td className="wg-num">{y.networkPrice.toFixed(4)}</td>
-                        <td className="wg-num">{y.revenueAutoConsumption.toFixed(2)} EUR</td>
-                        <td className="wg-num">{y.revenueRegimeSpecific.toFixed(2)} EUR</td>
-                        <td className="wg-num">{(y.revenueAutoConsumption + y.revenueRegimeSpecific).toFixed(2)} EUR</td>
-                        <td className="wg-num">{y.cashflowCumulative.toFixed(2)} EUR</td>
+                        <td className="wg-num">{formatEur(y.revenueAutoConsumption)}</td>
+                        <td className="wg-num">{formatEur(y.revenueRegimeSpecific)}</td>
+                        <td className="wg-num">{formatEur(y.revenueAutoConsumption + y.revenueRegimeSpecific)}</td>
+                        <td className="wg-num">{formatEur(y.cashflowCumulative)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -2916,6 +3336,31 @@ export default function App() {
               </label>
             </div>
 
+            {/* Responsable / PM We Green (decision 50, 15/09/2026) : champ
+                reel de l'offre (pas juste un affichage informatif de l'import
+                Odoo), pre-rempli automatiquement par "Importer depuis Odoo"
+                ci-dessous mais modifiable et repris dans l'onglet "Offre". */}
+            <div className="wg-panel wg-data-card">
+              <h2>Responsable / PM We Green</h2>
+              <label className="wg-field" style={{ marginBottom: 8 }}>
+                Nom
+                <input
+                  type="text"
+                  value={responsableNom}
+                  onChange={(e) => setResponsableNom(e.target.value)}
+                  placeholder="Pre-rempli par l'import Odoo, ou saisie manuelle"
+                />
+              </label>
+              <label className="wg-field" style={{ marginBottom: 8 }}>
+                Telephone
+                <input type="text" value={responsableTelephone} onChange={(e) => setResponsableTelephone(e.target.value)} />
+              </label>
+              <label className="wg-field">
+                Email
+                <input type="text" value={responsableEmail} onChange={(e) => setResponsableEmail(e.target.value)} />
+              </label>
+            </div>
+
             <div className="wg-panel wg-data-card">
               <h2>Production et auto-consommation</h2>
               <label className="wg-field" style={{ marginBottom: 10 }}>
@@ -2943,8 +3388,8 @@ export default function App() {
                 />
               </label>
               <p className="wg-muted" style={{ marginTop: 10 }}>
-                Import Archelios / Helioscope (a venir) : voir ci-dessous, pour pre-remplir le ratio de production
-                automatiquement.
+                Le ratio de production se renseigne ici manuellement, y compris depuis un rapport Archelios ou
+                Helioscope (voir "Import Archelios / Helioscope" ci-dessous pour recuperer l'image de calepinage).
               </p>
             </div>
 
@@ -3076,7 +3521,8 @@ export default function App() {
                     <p className="wg-muted">
                       Responsable (vendeur Odoo) : {odooResult.responsable.nom ?? "?"}
                       {odooResult.responsable.telephone ? ` · ${odooResult.responsable.telephone}` : ""}
-                      {odooResult.responsable.email ? ` · ${odooResult.responsable.email}` : ""}
+                      {odooResult.responsable.email ? ` · ${odooResult.responsable.email}` : ""} -- repris dans la fiche
+                      "Responsable / PM We Green" ci-dessus (modifiable si besoin).
                     </p>
                   )}
                   {summarizeOdooArticles(odooResult.articles).length > 0 && (
@@ -3085,6 +3531,83 @@ export default function App() {
                   <p className="wg-muted" style={{ fontStyle: "italic" }}>
                     {odooResult.avertissement}
                   </p>
+
+                  {/* Rapprochement articles Odoo -> catalogue de l'offre
+                      (decision 50, 15/09/2026) : BDC = devis client confirme
+                      (sale.order), meme objet que l'import ci-dessus -- pas
+                      de source de donnees supplementaire a interroger. */}
+                  {odooArticleMatch && (
+                    <div style={{ marginTop: 10 }}>
+                      <p style={{ marginBottom: 4 }}>
+                        <strong>Rapprochement avec le catalogue :</strong>
+                      </p>
+                      <ul style={{ margin: "4px 0 8px 18px", fontSize: 13 }}>
+                        {odooArticleMatch.panelSelections.map((sel) => {
+                          const p = panels.find((x) => x.id === sel.productId);
+                          return (
+                            <li key={`pv-${sel.key}`}>
+                              Panneaux : {sel.qty}x {p ? `${p.brand} ${p.modelName}` : sel.productId}
+                            </li>
+                          );
+                        })}
+                        {odooArticleMatch.inverterSelections.map((sel) => {
+                          const p = inverters.find((x) => x.id === sel.productId);
+                          return (
+                            <li key={`inv-${sel.key}`}>
+                              Onduleur : {sel.qty}x {p ? `${p.brand} ${p.modelName}` : sel.productId}
+                            </li>
+                          );
+                        })}
+                        {odooArticleMatch.batteryId &&
+                          (() => {
+                            const b = batteries.find((x) => x.id === odooArticleMatch.batteryId);
+                            return <li>Batterie : {b ? `${b.brand} ${b.modelName}` : odooArticleMatch.batteryId}</li>;
+                          })()}
+                        {odooArticleMatch.panelSelections.length === 0 &&
+                          odooArticleMatch.inverterSelections.length === 0 &&
+                          !odooArticleMatch.batteryId && <li>Aucun article rapproche automatiquement.</li>}
+                      </ul>
+                      {odooArticleMatch.unmatched.length > 0 && (
+                        <p className="wg-banner-warning" style={{ fontSize: 13 }}>
+                          {odooArticleMatch.unmatched.map((msg, i) => (
+                            <span key={i} style={{ display: "block" }}>
+                              {msg}
+                            </span>
+                          ))}
+                        </p>
+                      )}
+
+                      {!odooOverwriteConfirm && (
+                        <button type="button" className="wg-btn-primary" onClick={handleUseOdooArticlesClick}>
+                          Utiliser ces articles dans le calcul du prix
+                        </button>
+                      )}
+
+                      {odooOverwriteConfirm && (
+                        <div className="wg-banner-warning" style={{ marginTop: 6 }}>
+                          <p style={{ margin: "0 0 8px" }}>
+                            Des panneaux, onduleurs ou une batterie sont deja selectionnes dans "Calcul du prix". Les
+                            remplacer par les articles detectes dans ce devis Odoo ?
+                          </p>
+                          <div style={{ display: "flex", gap: 8 }}>
+                            <button type="button" className="wg-btn-primary" onClick={applyOdooArticlesToCalcul}>
+                              Ecraser et appliquer
+                            </button>
+                            <button type="button" className="wg-btn-link" onClick={() => setOdooOverwriteConfirm(false)}>
+                              Annuler
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {odooApplyMessage && (
+                        <p className="wg-muted" style={{ marginTop: 6 }}>
+                          {odooApplyMessage}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
                   {odooResult.lignes.length > 0 && (
                     <table className="wg-sheet" style={{ marginTop: 6 }}>
                       <thead>
@@ -3112,17 +3635,114 @@ export default function App() {
             </div>
 
             <div className="wg-panel wg-data-card">
-              <h2>Import Archelios / Helioscope (a venir)</h2>
+              <h2>Import Archelios / Helioscope</h2>
               <p className="wg-muted">
-                Emplacement reserve au futur import du rendement de production depuis Archelios ou Helioscope
-                (glisser-deposer). Placeholder uniquement : aucun fichier n'est traite pour l'instant, utilisez le
-                champ "Ratio de production" ci-dessus en attendant.
+                Deposez le rapport PDF Archelios ou Helioscope : la page de calepinage / implantation est detectee et
+                extraite automatiquement (meme mecanisme que dans le Briefing de chantier), et reprise dans l'offre.
+                Vous pouvez choisir une autre page si la detection ne correspond pas. Le ratio de production reste a
+                renseigner manuellement ci-dessus.
               </p>
-              <div className="wg-dropzone" onDragOver={(e) => e.preventDefault()} onDrop={(e) => e.preventDefault()}>
-                Glissez-deposez un export Archelios / Helioscope ici
-                <br />
-                <strong>A venir</strong>
-              </div>
+
+              {archeliosError && <p className="wg-banner-warning">{archeliosError}</p>}
+
+              {!archeliosImage && (
+                <label
+                  className="wg-dropzone"
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const file = e.dataTransfer.files?.[0];
+                    if (file) void handleArcheliosFile(file);
+                  }}
+                >
+                  {archeliosLoading ? (
+                    "Analyse du PDF..."
+                  ) : (
+                    <>
+                      Glissez-deposez le rapport PDF Archelios / Helioscope ici, ou cliquez pour parcourir
+                      <br />
+                      <strong>Fichier PDF uniquement</strong>
+                    </>
+                  )}
+                  <input
+                    type="file"
+                    accept="application/pdf"
+                    hidden
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) void handleArcheliosFile(file);
+                      e.target.value = "";
+                    }}
+                  />
+                </label>
+              )}
+
+              {archeliosImage && !archeliosBrowsing && (
+                <div>
+                  <img
+                    src={archeliosImage.dataUrl}
+                    alt="Calepinage / implantation photovoltaique"
+                    style={{ maxWidth: 320, border: "1px solid #d7e0da", borderRadius: 8, display: "block", marginBottom: 10 }}
+                  />
+                  <p className="wg-muted">
+                    {archeliosImage.auto
+                      ? `${archeliosImage.sourceType} detecte automatiquement -- page ${archeliosImage.pageNumber}/${archeliosImage.numPages} de ${archeliosImage.sourceFilename}.`
+                      : `Page ${archeliosImage.pageNumber}/${archeliosImage.numPages} choisie manuellement dans ${archeliosImage.sourceFilename}.`}{" "}
+                    Inseree dans l'offre, section "Votre installation photovoltaique".
+                  </p>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button type="button" disabled={archeliosLoading} onClick={openArcheliosBrowser}>
+                      Choisir une autre page
+                    </button>
+                    <button type="button" className="wg-btn-link" onClick={removeArcheliosImage}>
+                      Retirer / deposer un autre fichier
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {archeliosBrowsing && (
+                <div>
+                  <p className="wg-muted">
+                    {archeliosFilename} -- page {archeliosCurrentPage} / {archeliosNumPages}. Choisissez la page
+                    contenant le calepinage ou le rendu d'implantation.
+                  </p>
+                  {archeliosPreviewDataUrl && (
+                    <img
+                      src={archeliosPreviewDataUrl}
+                      alt={`Apercu page ${archeliosCurrentPage}`}
+                      style={{ maxWidth: 320, border: "1px solid #d7e0da", borderRadius: 8, display: "block", marginBottom: 10 }}
+                    />
+                  )}
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      disabled={archeliosLoading || archeliosCurrentPage <= 1}
+                      onClick={() => void goToArcheliosPage(archeliosCurrentPage - 1)}
+                    >
+                      Page precedente
+                    </button>
+                    <button
+                      type="button"
+                      disabled={archeliosLoading || archeliosCurrentPage >= archeliosNumPages}
+                      onClick={() => void goToArcheliosPage(archeliosCurrentPage + 1)}
+                    >
+                      Page suivante
+                    </button>
+                    <button
+                      type="button"
+                      className="wg-btn-primary"
+                      disabled={archeliosLoading}
+                      onClick={confirmArcheliosBrowsedPage}
+                    >
+                      Utiliser cette page
+                    </button>
+                    <button type="button" className="wg-btn-link" onClick={() => setArcheliosBrowsing(false)}>
+                      Annuler
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </>

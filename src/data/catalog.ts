@@ -53,7 +53,7 @@ export async function fetchProductsByCategory(categoryName: string): Promise<Pro
   const { data, error } = await client
     .from("products")
     .select(
-      "id, model_name, brand, unit_cost, safety_margin_pct, power_kva, power_w, phase_type, specs, product_categories!inner(name)",
+      "id, model_name, brand, unit_cost, safety_margin_pct, power_kva, power_w, phase_type, specs, datasheet_path, datasheet_filename, product_categories!inner(name)",
     )
     .eq("product_categories.name", categoryName)
     .eq("active", true)
@@ -70,7 +70,25 @@ export async function fetchProductsByCategory(categoryName: string): Promise<Pro
     powerW: row.power_w !== null ? Number(row.power_w) : null,
     specs: row.specs ?? {},
     phaseType: row.phase_type ?? null,
+    datasheetPath: row.datasheet_path ?? null,
+    datasheetFilename: row.datasheet_filename ?? null,
   }));
+}
+
+/** Bucket Storage dedie aux fiches techniques PDF des articles du catalogue (decision 50, migration product_datasheets). */
+export const PRODUCT_DATASHEETS_BUCKET = "product-datasheets";
+
+/**
+ * URL publique d'une fiche technique a partir de son chemin en base
+ * (`products.datasheet_path`). Bucket public en lecture (meme principe que la
+ * policy `lecture_publique` de la table `products`) : pas de signature
+ * necessaire. Retourne null si aucun chemin (rien a afficher).
+ */
+export function productDatasheetUrl(path: string | null | undefined): string | null {
+  if (!path) return null;
+  const client = supabase;
+  if (!client) return null;
+  return client.storage.from(PRODUCT_DATASHEETS_BUCKET).getPublicUrl(path).data.publicUrl;
 }
 
 export async function fetchBatteryComposition(productId: string): Promise<BatteryComposition | null> {

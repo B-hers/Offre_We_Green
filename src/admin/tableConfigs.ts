@@ -12,7 +12,7 @@
  * comment resoudre les cles etrangeres (fk) vers un libelle lisible.
  */
 
-export type AdminColumnType = "text" | "number" | "boolean" | "select-enum" | "select-fk" | "jsonb";
+export type AdminColumnType = "text" | "number" | "boolean" | "select-enum" | "select-fk" | "jsonb" | "file-pdf";
 
 export interface AdminColumn {
   key: string;
@@ -23,6 +23,15 @@ export interface AdminColumn {
   enumOptions?: string[];
   /** Reference vers une autre table admin pour peupler un <select>. */
   fk?: { table: string; valueKey: string; labelKey: string };
+  /**
+   * "file-pdf" uniquement (decision 50, 15/09/2026) : `key` porte la colonne
+   * de chemin Storage (ex "datasheet_path"), `filenameKey` la colonne
+   * compagnon pour le nom de fichier d'origine (affichage). L'upload/suppression
+   * ecrit directement en base (pas via le circuit "Enregistrer" habituel,
+   * puisqu'il s'agit d'une operation Storage + DB atomique) -- necessite une
+   * ligne deja existante (pas de fiche sur la ligne "Ajouter").
+   */
+  file?: { bucket: string; filenameKey: string };
 }
 
 export interface AdminTableConfig {
@@ -48,6 +57,13 @@ export interface AdminTableConfig {
    * uniquement pour les entrees qui ne sont pas seules sur leur table.
    */
   id?: string;
+  /**
+   * Active le bloc de recherche "Importer depuis Odoo" en haut de la vue
+   * (decision 50, 15/09/2026) : pre-remplit la ligne "Ajouter" a partir d'un
+   * article Odoo trouve par nom/reference. Uniquement pertinent pour les
+   * vues `products` (Panneaux PV / Onduleurs / Batteries) pour l'instant.
+   */
+  odooImportable?: boolean;
 }
 
 const num = (key: string, label: string, opts: Partial<AdminColumn> = {}): AdminColumn => ({
@@ -94,6 +110,16 @@ const productColumns: AdminColumn[] = [
   num("warranty_years", "Garantie (annees)", { nullable: true, step: 1 }),
   { key: "specs", label: "Caracteristiques additionnelles (JSON)", type: "jsonb" },
   bool("active", "Actif"),
+  // Fiche technique PDF par article (decision 50, 15/09/2026, demande de Ben :
+  // "pour chaque article, je dois pouvoir ajouter la fiche technique ?") --
+  // un PDF joint, pas de champs structures (confirme par Ben).
+  {
+    key: "datasheet_path",
+    label: "Fiche technique (PDF)",
+    type: "file-pdf",
+    nullable: true,
+    file: { bucket: "product-datasheets", filenameKey: "datasheet_filename" },
+  },
 ];
 
 export const ADMIN_TABLES: AdminTableConfig[] = [
@@ -109,6 +135,7 @@ export const ADMIN_TABLES: AdminTableConfig[] = [
     pageSize: 100,
     fixedFilter: { column: "category_id", value: CATEGORY_ID_PANNEAUX_PV },
     columns: productColumns,
+    odooImportable: true,
   },
   {
     id: "products_onduleurs",
@@ -118,6 +145,7 @@ export const ADMIN_TABLES: AdminTableConfig[] = [
     pageSize: 100,
     fixedFilter: { column: "category_id", value: CATEGORY_ID_ONDULEURS },
     columns: productColumns,
+    odooImportable: true,
   },
   {
     id: "products_batteries",
@@ -127,6 +155,7 @@ export const ADMIN_TABLES: AdminTableConfig[] = [
     pageSize: 100,
     fixedFilter: { column: "category_id", value: CATEGORY_ID_BATTERIES },
     columns: productColumns,
+    odooImportable: true,
   },
   {
     table: "product_categories",
